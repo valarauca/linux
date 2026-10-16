@@ -12,6 +12,7 @@
 
 #include "xe_ttm_vram_mgr_types.h"
 
+struct p2pdma_provider;
 struct xe_device;
 struct xe_migrate;
 
@@ -63,6 +64,13 @@ struct xe_vram_region {
 	struct xe_ttm_vram_mgr ttm;
 	/** @placement: TTM placement dedicated for this region */
 	u32 placement;
+	/**
+	 * @p2p_provider: PCI P2PDMA provider for the BAR backing this region
+	 *
+	 * NULL when the BAR cannot be used for peer-to-peer DMA, in which
+	 * case VRAM is never exported to dma-buf importers directly.
+	 */
+	struct p2pdma_provider *p2p_provider;
 #if IS_ENABLED(CONFIG_DRM_XE_PAGEMAP)
 	/** @migrate: Back pointer to migrate */
 	struct xe_migrate *migrate;
