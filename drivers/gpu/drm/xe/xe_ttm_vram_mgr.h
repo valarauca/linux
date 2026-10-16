@@ -9,6 +9,7 @@
 #include "xe_ttm_vram_mgr_types.h"
 
 enum dma_data_direction;
+struct dma_buf_attachment;
 struct xe_device;
 struct xe_tile;
 struct xe_vram_region;
@@ -20,10 +21,11 @@ int xe_ttm_vram_mgr_init(struct xe_device *xe, struct xe_vram_region *vram);
 int xe_ttm_vram_mgr_alloc_sgt(struct xe_device *xe,
 			      struct ttm_resource *res,
 			      u64 offset, u64 length,
-			      struct device *dev,
+			      struct dma_buf_attachment *attach,
 			      enum dma_data_direction dir,
 			      struct sg_table **sgt);
-void xe_ttm_vram_mgr_free_sgt(struct device *dev, enum dma_data_direction dir,
+void xe_ttm_vram_mgr_free_sgt(struct dma_buf_attachment *attach,
+			      enum dma_data_direction dir,
 			      struct sg_table *sgt);
 
 u64 xe_ttm_vram_get_avail(struct ttm_resource_manager *man);

@@ -5,6 +5,7 @@
  */
 
 #include <linux/cgroup_dmem.h>
+#include <linux/dma-buf-mapping.h>
 
 #include <drm/drm_managed.h>
 #include <drm/drm_drv.h>
@@ -401,95 +402,60 @@ int xe_ttm_vram_mgr_init(struct xe_device *xe, struct xe_vram_region *vram)
 int xe_ttm_vram_mgr_alloc_sgt(struct xe_device *xe,
 			      struct ttm_resource *res,
 			      u64 offset, u64 length,
-			      struct device *dev,
+			      struct dma_buf_attachment *attach,
 			      enum dma_data_direction dir,
 			      struct sg_table **sgt)
 {
 	struct xe_tile *tile = &xe->tiles[res->mem_type - XE_PL_VRAM0];
+	struct xe_vram_region *vram = tile->mem.vram;
 	struct xe_ttm_vram_mgr_resource *vres = to_xe_ttm_vram_mgr_resource(res);
 	struct xe_res_cursor cursor;
-	struct scatterlist *sg;
-	int num_entries = 0;
-	int i, r;
+	struct phys_vec *phys_vec;
+	struct sg_table *table;
+	size_t nr_ranges = 0;
+	size_t total = 0;
+	size_t i = 0;
 
 	if (vres->used_visible_size < res->size)
 		return -EOPNOTSUPP;
 
-	*sgt = kmalloc_obj(**sgt);
-	if (!*sgt)
-		return -ENOMEM;
+	if (!vram->p2p_provider)
+		return -EOPNOTSUPP;
 
-	/* Determine the number of GPU_BUDDY blocks to export */
 	xe_res_first(res, offset, length, &cursor);
 	while (cursor.remaining) {
-		num_entries++;
-		/* Limit maximum size to 2GiB due to SG table limitations. */
-		xe_res_next(&cursor, min_t(u64, cursor.size, SZ_2G));
+		nr_ranges++;
+		xe_res_next(&cursor, cursor.size);
 	}
 
-	r = sg_alloc_table(*sgt, num_entries, GFP_KERNEL);
-	if (r)
-		goto error_free;
+	phys_vec = kvmalloc_objs(*phys_vec, nr_ranges);
+	if (!phys_vec)
+		return -ENOMEM;
 
-	/* Initialize scatterlist nodes of sg_table */
-	for_each_sgtable_sg((*sgt), sg, i)
-		sg->length = 0;
-
-	/*
-	 * Walk down GPU_BUDDY blocks to populate scatterlist nodes
-	 * @note: Use iterator api to get first the GPU_BUDDY block
-	 * and the number of bytes from it. Access the following
-	 * GPU_BUDDY block(s) if more buffer needs to exported
-	 */
 	xe_res_first(res, offset, length, &cursor);
-	for_each_sgtable_sg((*sgt), sg, i) {
-		phys_addr_t phys = cursor.start + xe_vram_region_io_start(tile->mem.vram);
-		size_t size = min_t(u64, cursor.size, SZ_2G);
-		dma_addr_t addr;
-
-		addr = dma_map_resource(dev, phys, size, dir,
-					DMA_ATTR_SKIP_CPU_SYNC);
-		r = dma_mapping_error(dev, addr);
-		if (r)
-			goto error_unmap;
-
-		sg_set_page(sg, NULL, size, 0);
-		sg_dma_address(sg) = addr;
-		sg_dma_len(sg) = size;
-
-		xe_res_next(&cursor, size);
+	while (cursor.remaining) {
+		phys_vec[i].paddr = xe_vram_region_io_start(vram) + cursor.start;
+		phys_vec[i].len = cursor.size;
+		total += cursor.size;
+		i++;
+		xe_res_next(&cursor, cursor.size);
 	}
 
+	table = dma_buf_phys_vec_to_sgt(attach, vram->p2p_provider, phys_vec,
+					nr_ranges, total, dir);
+	kvfree(phys_vec);
+	if (IS_ERR(table))
+		return PTR_ERR(table);
+
+	*sgt = table;
 	return 0;
-
-error_unmap:
-	for_each_sgtable_sg((*sgt), sg, i) {
-		if (!sg->length)
-			continue;
-
-		dma_unmap_resource(dev, sg->dma_address,
-				   sg->length, dir,
-				   DMA_ATTR_SKIP_CPU_SYNC);
-	}
-	sg_free_table(*sgt);
-
-error_free:
-	kfree(*sgt);
-	return r;
 }
 
-void xe_ttm_vram_mgr_free_sgt(struct device *dev, enum dma_data_direction dir,
+void xe_ttm_vram_mgr_free_sgt(struct dma_buf_attachment *attach,
+			      enum dma_data_direction dir,
 			      struct sg_table *sgt)
 {
-	struct scatterlist *sg;
-	int i;
-
-	for_each_sgtable_sg(sgt, sg, i)
-		dma_unmap_resource(dev, sg->dma_address,
-				   sg->length, dir,
-				   DMA_ATTR_SKIP_CPU_SYNC);
-	sg_free_table(sgt);
-	kfree(sgt);
+	dma_buf_free_sgt(attach, sgt, dir);
 }
 
 u64 xe_ttm_vram_get_cpu_visible_size(struct ttm_resource_manager *man)

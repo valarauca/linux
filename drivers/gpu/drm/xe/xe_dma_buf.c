@@ -22,19 +22,29 @@
 
 MODULE_IMPORT_NS("DMA_BUF");
 
+static bool xe_dma_buf_has_p2p_provider(struct xe_device *xe)
+{
+	return xe->mem.vram && xe->mem.vram->p2p_provider;
+}
+
 static int xe_dma_buf_attach(struct dma_buf *dmabuf,
 			     struct dma_buf_attachment *attach)
 {
 	struct drm_gem_object *obj = attach->dmabuf->priv;
+	struct xe_device *xe = to_xe_device(obj->dev);
 
 	if (attach->peer2peer &&
-	    pci_p2pdma_distance(to_pci_dev(obj->dev->dev), attach->dev, false) < 0)
+	    (!xe_dma_buf_has_p2p_provider(xe) ||
+	     pci_p2pdma_distance(to_pci_dev(obj->dev->dev), attach->dev, false) < 0)) {
+		drm_dbg(&xe->drm, "peer-to-peer disabled for dma-buf importer %s\n",
+			dev_name(attach->dev));
 		attach->peer2peer = false;
+	}
 
 	if (!attach->peer2peer && !xe_bo_can_migrate(gem_to_xe_bo(obj), XE_PL_TT))
 		return -EOPNOTSUPP;
 
-	xe_pm_runtime_get(to_xe_device(obj->dev));
+	xe_pm_runtime_get(xe);
 	return 0;
 }
 
@@ -133,7 +143,7 @@ static struct sg_table *xe_dma_buf_map(struct dma_buf_attachment *attach,
 	case XE_PL_VRAM1:
 		r = xe_ttm_vram_mgr_alloc_sgt(xe_bo_device(bo),
 					      bo->ttm.resource, 0,
-					      bo->ttm.base.size, attach->dev,
+					      bo->ttm.base.size, attach,
 					      dir, &sgt);
 		if (r)
 			return ERR_PTR(r);
@@ -159,7 +169,7 @@ static void xe_dma_buf_unmap(struct dma_buf_attachment *attach,
 		sg_free_table(sgt);
 		kfree(sgt);
 	} else {
-		xe_ttm_vram_mgr_free_sgt(attach->dev, dir, sgt);
+		xe_ttm_vram_mgr_free_sgt(attach, dir, sgt);
 	}
 }
 
