@@ -373,9 +373,9 @@ static int io_init_rw_fixed(struct io_kiocb *req, unsigned int issue_flags,
 	}
 
 	ret = io_attach_dmabuf_map(req, &io->iter, issue_flags);
-	if (ret)
-		return ret;
-	return 0;
+	if (ret == -EAGAIN && (rw->flags & RWF_NOWAIT))
+		req->flags |= REQ_F_NOWAIT;
+	return ret;
 }
 
 int io_prep_read_fixed(struct io_kiocb *req, const struct io_uring_sqe *sqe)
@@ -605,6 +605,8 @@ static void io_complete_rw_iopoll(struct kiocb *kiocb, long res)
 	struct io_rw *rw = container_of(kiocb, struct io_rw, kiocb);
 	struct io_kiocb *req = cmd_to_io_kiocb(rw);
 	int final_res = io_fixup_rw_res(req, res);
+
+	io_detach_dmabuf_map(req);
 
 	if (kiocb->ki_flags & IOCB_WRITE)
 		io_req_end_write(req);
@@ -1237,7 +1239,7 @@ int io_read_fixed(struct io_kiocb *req, unsigned int issue_flags)
 
 	ret = io_init_rw_fixed(req, issue_flags, ITER_DEST);
 	if (unlikely(ret))
-		return ret;
+		return io_fixup_restart_res(ret);
 
 	ret = io_read(req, issue_flags);
 	if (ret != -EIOCBQUEUED)
@@ -1251,7 +1253,7 @@ int io_write_fixed(struct io_kiocb *req, unsigned int issue_flags)
 
 	ret = io_init_rw_fixed(req, issue_flags, ITER_SOURCE);
 	if (unlikely(ret))
-		return ret;
+		return io_fixup_restart_res(ret);
 
 	ret = io_write(req, issue_flags);
 	if (ret != -EIOCBQUEUED)

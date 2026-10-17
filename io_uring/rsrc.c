@@ -918,8 +918,8 @@ err:
 static struct io_rsrc_node *io_sqe_buffer_register(struct io_ring_ctx *ctx,
 						   struct io_uring_regbuf_desc *desc)
 {
-	unsigned long uaddr = (unsigned long)desc->uaddr;
-	size_t size = desc->size;
+	unsigned long uaddr;
+	size_t size;
 	struct io_mapped_ubuf *imu = NULL;
 	struct page **pages = NULL;
 	struct io_rsrc_node *node;
@@ -940,15 +940,17 @@ static struct io_rsrc_node *io_sqe_buffer_register(struct io_ring_ctx *ctx,
 		return ERR_PTR(-EINVAL);
 
 	if (desc->type == IO_REGBUF_TYPE_EMPTY) {
-		if (uaddr || size)
+		if (desc->uaddr || desc->size)
 			return ERR_PTR(-EFAULT);
 		/* remove the buffer without installing a new one */
 		return NULL;
 	}
 
-	ret = io_validate_user_buf_range(uaddr, size);
+	ret = io_validate_user_buf_range(desc->uaddr, desc->size);
 	if (ret)
 		return ERR_PTR(ret);
+	uaddr = desc->uaddr;
+	size = desc->size;
 
 	node = io_rsrc_node_alloc(ctx, IORING_RSRC_BUFFER);
 	if (!node)
@@ -1483,7 +1485,9 @@ static int io_clone_buffers(struct io_ring_ctx *ctx, struct io_ring_ctx *src_ctx
 		if (!src_node) {
 			dst_node = NULL;
 		} else {
-			if (src_node->buf->flags & IO_REGBUF_F_UNCLONEABLE) {
+			if ((src_node->buf->flags & IO_REGBUF_F_UNCLONEABLE) ||
+			    ((src_node->buf->flags & IO_REGBUF_F_DMABUF) &&
+			     (ctx->flags & IORING_SETUP_IOPOLL))) {
 				io_rsrc_data_free(ctx, &data);
 				return -EOPNOTSUPP;
 			}
