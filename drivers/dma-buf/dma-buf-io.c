@@ -54,7 +54,8 @@ int dma_buf_io_init_map(struct dma_buf_io_ctx *ctx, struct dma_buf_io_map *map,
 	for_each_sgtable_dma_sg(sgt, sg, tmp)
 		seg_shift = min(seg_shift, __ffs(sg_dma_len(sg)));
 
-	ret = percpu_ref_init(&map->refs, dma_buf_io_map_refs_cb, 0, GFP_KERNEL);
+	ret = percpu_ref_init(&map->refs, dma_buf_io_map_refs_cb, 0,
+			      GFP_KERNEL_ACCOUNT);
 	if (ret)
 		return ret;
 	init_completion(&map->drained);
@@ -134,7 +135,7 @@ int dma_buf_io_ctx_create(struct file *file,
 	if (!file->f_op->init_dma_buf_io_ctx)
 		return -EOPNOTSUPP;
 
-	ctx = kzalloc_obj(*ctx);
+	ctx = kzalloc_obj(*ctx, GFP_KERNEL_ACCOUNT);
 	if (!ctx)
 		return -ENOMEM;
 	ctx->dir = dir;

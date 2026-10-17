@@ -23,11 +23,17 @@ struct nvme_dma_buf_io_ctx {
 	struct list_head list;
 };
 
+struct nvme_dmabuf_seg {
+	size_t offset;
+	dma_addr_t addr;
+	unsigned int len;
+};
+
 struct nvme_dmabuf_map {
 	struct dma_buf_io_map base;
 	struct sg_table *sgt;
-	unsigned nr_entries;
-	dma_addr_t dma_list[] __counted_by(nr_entries);
+	unsigned nr_segs;
+	struct nvme_dmabuf_seg segs[] __counted_by(nr_segs);
 };
 
 static inline struct nvme_dmabuf_map *to_nvme_dmabuf_map(
