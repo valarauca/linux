@@ -935,6 +935,27 @@ struct drm_xe_gem_create {
  *     err = ioctl(fd, DRM_IOCTL_XE_GEM_MMAP_OFFSET, &mmo);
  *     map = mmap(NULL, size, PROT_WRITE, MAP_SHARED, fd, mmo.offset);
  *     map[i] = 0xdeadbeef; // issue barrier
+ *
+ *  - %DRM_XE_MMAP_OFFSET_FLAG_P2P_CARVEOUT - For user to query the special
+ *    offset that allocates from the PCI P2PDMA carve-out set up with the
+ *    p2p_carveout_mb module parameter. Every mmap at the returned offset
+ *    allocates a new zeroed chunk of VRAM the size of the mapping, which
+ *    must be shared. The mapping is backed by pages, so it can be used as an
+ *    O_DIRECT read or write buffer and bound to the GPU with
+ *    %DRM_XE_VM_BIND_OP_MAP_USERPTR. The chunk is freed once it is unmapped
+ *    and any I/O using it has completed. Returns -ENODEV when the device has
+ *    no carve-out.
+ *
+ * .. code-block:: C
+ *
+ *     struct drm_xe_gem_mmap_offset mmo = {
+ *         .handle = 0, // must be set to 0
+ *         .flags = DRM_XE_MMAP_OFFSET_FLAG_P2P_CARVEOUT,
+ *     };
+ *
+ *     err = ioctl(fd, DRM_IOCTL_XE_GEM_MMAP_OFFSET, &mmo);
+ *     buf = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, mmo.offset);
+ *     pread(file_opened_with_O_DIRECT, buf, size, file_offset);
  */
 struct drm_xe_gem_mmap_offset {
 	/** @extensions: Pointer to the first extension struct, if any */
@@ -944,6 +965,7 @@ struct drm_xe_gem_mmap_offset {
 	__u32 handle;
 
 #define DRM_XE_MMAP_OFFSET_FLAG_PCI_BARRIER     (1 << 0)
+#define DRM_XE_MMAP_OFFSET_FLAG_P2P_CARVEOUT    (1 << 1)
 	/** @flags: Flags */
 	__u32 flags;
 

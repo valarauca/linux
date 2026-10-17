@@ -357,6 +357,8 @@ static int xe_mmap(struct file *filp, struct vm_area_struct *vma)
 	switch (vma->vm_pgoff) {
 	case XE_PCI_BARRIER_MMAP_OFFSET >> XE_PTE_SHIFT:
 		return xe_pci_barrier_mmap(filp, vma);
+	case XE_P2P_CARVEOUT_MMAP_OFFSET >> XE_PTE_SHIFT:
+		return xe_vram_p2p_carveout_mmap(to_xe_device(dev), vma);
 	}
 
 	return drm_gem_mmap(filp, vma);

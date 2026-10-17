@@ -39,6 +39,7 @@
 #include "xe_trace_bo.h"
 #include "xe_ttm_stolen_mgr.h"
 #include "xe_vm.h"
+#include "xe_vram.h"
 #include "xe_vram_types.h"
 
 const char *const xe_mem_type_to_name[TTM_NUM_MEM_TYPES]  = {
@@ -3765,8 +3766,25 @@ int xe_gem_mmap_offset_ioctl(struct drm_device *dev, void *data,
 		return -EINVAL;
 
 	if (XE_IOCTL_DBG(xe, args->flags &
-			 ~DRM_XE_MMAP_OFFSET_FLAG_PCI_BARRIER))
+			 ~(DRM_XE_MMAP_OFFSET_FLAG_PCI_BARRIER |
+			   DRM_XE_MMAP_OFFSET_FLAG_P2P_CARVEOUT)))
 		return -EINVAL;
+
+	if (args->flags & DRM_XE_MMAP_OFFSET_FLAG_P2P_CARVEOUT) {
+		if (XE_IOCTL_DBG(xe, args->flags & DRM_XE_MMAP_OFFSET_FLAG_PCI_BARRIER))
+			return -EINVAL;
+
+		if (XE_IOCTL_DBG(xe, args->handle))
+			return -EINVAL;
+
+		if (!xe_vram_has_p2p_carveout(xe))
+			return -ENODEV;
+
+		BUILD_BUG_ON((XE_P2P_CARVEOUT_MMAP_OFFSET >> XE_PTE_SHIFT) >=
+			     DRM_FILE_PAGE_OFFSET_START);
+		args->offset = XE_P2P_CARVEOUT_MMAP_OFFSET;
+		return 0;
+	}
 
 	if (args->flags & DRM_XE_MMAP_OFFSET_FLAG_PCI_BARRIER) {
 		if (XE_IOCTL_DBG(xe, !IS_DGFX(xe)))
