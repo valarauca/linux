@@ -13,6 +13,7 @@
 #include "xe_ttm_vram_mgr_types.h"
 
 struct p2pdma_provider;
+struct xe_bo;
 struct xe_device;
 struct xe_migrate;
 
@@ -71,6 +72,19 @@ struct xe_vram_region {
 	 * case VRAM is never exported to dma-buf importers directly.
 	 */
 	struct p2pdma_provider *p2p_provider;
+	/**
+	 * @p2p_carveout: Pinned BO reserving the VRAM handed to PCI P2PDMA
+	 *
+	 * NULL unless the p2p_carveout_mb module parameter is set. The range
+	 * has ZONE_DEVICE pages, so userspace can map it through the PCI
+	 * p2pmem allocator, use it as an O_DIRECT target and bind the same
+	 * mapping to the GPU as a userptr.
+	 */
+	struct xe_bo *p2p_carveout;
+	/** @p2p_carveout_start: Offset of @p2p_carveout within this region */
+	resource_size_t p2p_carveout_start;
+	/** @p2p_carveout_size: Size of @p2p_carveout, 0 when there is none */
+	resource_size_t p2p_carveout_size;
 #if IS_ENABLED(CONFIG_DRM_XE_PAGEMAP)
 	/** @migrate: Back pointer to migrate */
 	struct xe_migrate *migrate;

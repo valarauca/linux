@@ -8,8 +8,12 @@
 
 #include <linux/mm.h>
 
+#include <drm/drm_pagemap.h>
+
+#include "xe_device.h"
 #include "xe_tlb_inval.h"
 #include "xe_trace_bo.h"
+#include "xe_vram_types.h"
 
 static void xe_userptr_assert_in_notifier(struct xe_vm *vm)
 {
@@ -57,6 +61,35 @@ int __xe_vm_userptr_needs_repin(struct xe_vm *vm)
 		list_empty(&vm->userptr.invalidated)) ? 0 : -EAGAIN;
 }
 
+static int xe_userptr_p2pdma_map(struct drm_device *drm, struct page *page,
+				 unsigned int order, enum dma_data_direction dir,
+				 struct drm_pagemap_addr *addr)
+{
+	struct xe_device *xe = to_xe_device(drm);
+	phys_addr_t phys = page_to_phys(page);
+	struct xe_tile *tile;
+	u8 id;
+
+	for_each_tile(tile, xe, id) {
+		struct xe_vram_region *vram = tile->mem.vram;
+		resource_size_t start;
+
+		if (!vram || !vram->p2p_carveout_size)
+			continue;
+
+		start = vram->io_start + vram->p2p_carveout_start;
+		if (phys < start ||
+		    phys + (PAGE_SIZE << order) > start + vram->p2p_carveout_size)
+			continue;
+
+		*addr = drm_pagemap_addr_encode(vram->dpa_base + phys - vram->io_start,
+						XE_INTERCONNECT_VRAM, order, dir);
+		return 0;
+	}
+
+	return -EOPNOTSUPP;
+}
+
 int xe_vma_userptr_pin_pages(struct xe_userptr_vma *uvma)
 {
 	struct xe_vma *vma = &uvma->vma;
@@ -65,6 +98,7 @@ int xe_vma_userptr_pin_pages(struct xe_userptr_vma *uvma)
 	struct drm_gpusvm_ctx ctx = {
 		.read_only = xe_vma_read_only(vma),
 		.device_private_page_owner = xe_svm_private_page_owner(vm, false),
+		.p2pdma_map = xe_userptr_p2pdma_map,
 		.allow_mixed = true,
 	};
 

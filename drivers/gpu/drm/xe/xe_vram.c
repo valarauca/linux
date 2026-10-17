@@ -19,6 +19,7 @@
 #include "xe_force_wake.h"
 #include "xe_gt_mcr.h"
 #include "xe_mmio.h"
+#include "xe_module.h"
 #include "xe_sriov.h"
 #include "xe_tile_sriov_vf.h"
 #include "xe_ttm_vram_mgr.h"
@@ -372,6 +373,86 @@ int xe_vram_probe(struct xe_device *xe)
 		return err;
 
 	return devm_add_action_or_reset(xe->drm.dev, vram_fini, xe);
+}
+
+static void p2p_carveout_fini(void *arg)
+{
+	struct xe_vram_region *vram = arg;
+
+	xe_bo_unpin_map_no_vm(vram->p2p_carveout);
+	vram->p2p_carveout = NULL;
+	vram->p2p_carveout_size = 0;
+}
+
+/**
+ * xe_vram_init_p2p_carveout() - Hand a fixed range of VRAM to PCI P2PDMA
+ * @tile: the tile whose VRAM is carved
+ *
+ * Reserve xe_modparam.p2p_carveout_mb of VRAM, rounded up to 2MiB, at the
+ * top of the tile's CPU visible VRAM with a pinned BO, then register the
+ * matching part of the LMEM BAR with pci_p2pdma_add_resource(). The range
+ * gets ZONE_DEVICE pages, so userspace can map it through the p2pmem sysfs
+ * allocator and use it as an O_DIRECT target on any filesystem. The pinned
+ * BO keeps TTM from ever placing or moving anything there.
+ *
+ * Failing to register the range is not fatal. The device then runs without
+ * a carve-out.
+ *
+ * Return: 0 on success, negative error code on failure.
+ */
+int xe_vram_init_p2p_carveout(struct xe_tile *tile)
+{
+	struct xe_device *xe = tile_to_xe(tile);
+	struct pci_dev *pdev = to_pci_dev(xe->drm.dev);
+	struct xe_vram_region *vram = tile->mem.vram;
+	u64 size = ALIGN((u64)xe_modparam.p2p_carveout_mb * SZ_1M, SZ_2M);
+	u64 start, end;
+	struct xe_bo *bo;
+	int err;
+
+	if (!IS_DGFX(xe) || !size || !vram || !vram->p2p_provider)
+		return 0;
+
+	end = ALIGN_DOWN(min_t(u64, vram->usable_size, vram->io_size), SZ_2M);
+	if (size > end) {
+		drm_warn(&xe->drm, "VRAM[%u]: P2P carve-out of %lluMiB exceeds CPU visible VRAM\n",
+			 vram->id, size / SZ_1M);
+		return 0;
+	}
+	start = end - size;
+
+	bo = xe_bo_create_pin_range_novm(xe, tile, size, start, end,
+					 ttm_bo_type_kernel,
+					 XE_BO_FLAG_VRAM(vram) |
+					 XE_BO_FLAG_PINNED |
+					 XE_BO_FLAG_PINNED_LATE_RESTORE |
+					 XE_BO_FLAG_FORCE_USER_VRAM);
+	if (IS_ERR(bo)) {
+		drm_warn(&xe->drm, "VRAM[%u]: failed to reserve P2P carve-out: %pe\n",
+			 vram->id, bo);
+		return 0;
+	}
+
+	vram->p2p_carveout = bo;
+	vram->p2p_carveout_start = start;
+	vram->p2p_carveout_size = size;
+	err = devm_add_action_or_reset(xe->drm.dev, p2p_carveout_fini, vram);
+	if (err)
+		return err;
+
+	err = pci_p2pdma_add_resource(pdev, LMEM_BAR, size,
+				      vram->io_start + start -
+				      pci_resource_start(pdev, LMEM_BAR));
+	if (err) {
+		drm_warn(&xe->drm, "VRAM[%u]: failed to register P2P carve-out: %pe\n",
+			 vram->id, ERR_PTR(err));
+		devm_release_action(xe->drm.dev, p2p_carveout_fini, vram);
+		return 0;
+	}
+
+	drm_info(&xe->drm, "VRAM[%u]: %lluMiB P2P carve-out at offset %#llx\n",
+		 vram->id, size / SZ_1M, start);
+	return 0;
 }
 
 /**
