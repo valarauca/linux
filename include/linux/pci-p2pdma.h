@@ -15,6 +15,7 @@
 
 struct block_device;
 struct scatterlist;
+struct vm_area_struct;
 
 /**
  * struct p2pdma_provider
@@ -82,6 +83,8 @@ struct scatterlist *pci_p2pmem_alloc_sgl(struct pci_dev *pdev,
 					 unsigned int *nents, u32 length);
 void pci_p2pmem_free_sgl(struct pci_dev *pdev, struct scatterlist *sgl);
 void pci_p2pmem_publish(struct pci_dev *pdev, bool publish);
+int pci_p2pmem_alloc_mmap(struct pci_dev *pdev, struct vm_area_struct *vma,
+			  bool zero);
 int pci_p2pdma_enable_store(const char *page, struct pci_dev **p2p_dev,
 			    bool *use_p2pdma);
 ssize_t pci_p2pdma_enable_show(char *page, struct pci_dev *p2p_dev,
@@ -137,6 +140,11 @@ static inline void pci_p2pmem_free_sgl(struct pci_dev *pdev,
 }
 static inline void pci_p2pmem_publish(struct pci_dev *pdev, bool publish)
 {
+}
+static inline int pci_p2pmem_alloc_mmap(struct pci_dev *pdev,
+		struct vm_area_struct *vma, bool zero)
+{
+	return -EOPNOTSUPP;
 }
 static inline int pci_p2pdma_enable_store(const char *page,
 		struct pci_dev **p2p_dev, bool *use_p2pdma)

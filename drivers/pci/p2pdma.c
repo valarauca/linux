@@ -89,10 +89,24 @@ static ssize_t published_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RO(published);
 
-static int p2pmem_alloc_mmap(struct file *filp, struct kobject *kobj,
-		const struct bin_attribute *attr, struct vm_area_struct *vma)
+/**
+ * pci_p2pmem_alloc_mmap - allocate p2pmem and map it into a userspace VMA
+ * @pdev: the device providing the memory
+ * @vma: the VMA to fill, which must be a shared mapping
+ * @zero: clear the memory before mapping it
+ *
+ * Allocate a chunk of @pdev's p2pmem covering @vma and insert its pages, so
+ * the mapping can be pinned with FOLL_PCI_P2PDMA and used for O_DIRECT. The
+ * memory goes back to the pool once the VMA is unmapped and every other page
+ * reference, such as a pin held by in-flight I/O, has been dropped. Pass
+ * @zero when the pool is shared between users that must not see each
+ * other's data.
+ *
+ * Return: 0 on success, negative error code on failure.
+ */
+int pci_p2pmem_alloc_mmap(struct pci_dev *pdev, struct vm_area_struct *vma,
+			  bool zero)
 {
-	struct pci_dev *pdev = to_pci_dev(kobj_to_dev(kobj));
 	size_t len = vma->vm_end - vma->vm_start;
 	struct pci_p2pdma *p2pdma;
 	struct percpu_ref *ref;
@@ -104,13 +118,6 @@ static int p2pmem_alloc_mmap(struct file *filp, struct kobject *kobj,
 	if ((vma->vm_flags & VM_MAYSHARE) != VM_MAYSHARE) {
 		pci_info_ratelimited(pdev,
 				     "%s: fail, attempted private mapping\n",
-				     current->comm);
-		return -EINVAL;
-	}
-
-	if (vma->vm_pgoff) {
-		pci_info_ratelimited(pdev,
-				     "%s: fail, attempted mapping with non-zero offset\n",
 				     current->comm);
 		return -EINVAL;
 	}
@@ -148,6 +155,8 @@ static int p2pmem_alloc_mmap(struct file *filp, struct kobject *kobj,
 		 * using it.
 		 */
 		VM_WARN_ON_ONCE_PAGE(page_ref_count(page), page);
+		if (zero)
+			memset(kaddr, 0, PAGE_SIZE);
 		set_page_count(page, 1);
 		ret = vm_insert_page(vma, vaddr, page);
 		if (ret) {
@@ -166,6 +175,7 @@ static int p2pmem_alloc_mmap(struct file *filp, struct kobject *kobj,
 		put_page(page);
 		kaddr += PAGE_SIZE;
 		len -= PAGE_SIZE;
+		cond_resched();
 	}
 
 	percpu_ref_put(ref);
@@ -176,6 +186,22 @@ out_free_mem:
 out:
 	rcu_read_unlock();
 	return ret;
+}
+EXPORT_SYMBOL_GPL(pci_p2pmem_alloc_mmap);
+
+static int p2pmem_alloc_mmap(struct file *filp, struct kobject *kobj,
+		const struct bin_attribute *attr, struct vm_area_struct *vma)
+{
+	struct pci_dev *pdev = to_pci_dev(kobj_to_dev(kobj));
+
+	if (vma->vm_pgoff) {
+		pci_info_ratelimited(pdev,
+				     "%s: fail, attempted mapping with non-zero offset\n",
+				     current->comm);
+		return -EINVAL;
+	}
+
+	return pci_p2pmem_alloc_mmap(pdev, vma, false);
 }
 
 static const struct bin_attribute p2pmem_alloc_attr = {
