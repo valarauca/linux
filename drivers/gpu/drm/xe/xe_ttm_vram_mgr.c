@@ -415,6 +415,7 @@ int xe_ttm_vram_mgr_alloc_sgt(struct xe_device *xe,
 	size_t nr_ranges = 0;
 	size_t total = 0;
 	size_t i = 0;
+	int idx;
 
 	if (vres->used_visible_size < res->size)
 		return -EOPNOTSUPP;
@@ -441,8 +442,13 @@ int xe_ttm_vram_mgr_alloc_sgt(struct xe_device *xe,
 		xe_res_next(&cursor, cursor.size);
 	}
 
-	table = dma_buf_phys_vec_to_sgt(attach, vram->p2p_provider, phys_vec,
-					nr_ranges, total, dir);
+	if (drm_dev_enter(&xe->drm, &idx)) {
+		table = dma_buf_phys_vec_to_sgt(attach, vram->p2p_provider,
+						phys_vec, nr_ranges, total, dir);
+		drm_dev_exit(idx);
+	} else {
+		table = ERR_PTR(-ENODEV);
+	}
 	kvfree(phys_vec);
 	if (IS_ERR(table))
 		return PTR_ERR(table);

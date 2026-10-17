@@ -1357,6 +1357,21 @@ xe_bo_eviction_valuable(struct ttm_buffer_object *bo, const struct ttm_place *pl
 	return true;
 }
 
+static bool xe_bo_has_dynamic_importer(struct xe_bo *bo)
+{
+	struct dma_buf *dmabuf = bo->ttm.base.dma_buf;
+	struct dma_buf_attachment *attach;
+
+	if (!dmabuf || bo->ttm.base.import_attach)
+		return false;
+
+	list_for_each_entry(attach, &dmabuf->attachments, node)
+		if (attach->importer_ops)
+			return true;
+
+	return false;
+}
+
 /**
  * xe_bo_shrink() - Try to shrink an xe bo.
  * @ctx: The struct ttm_operation_ctx used for shrinking.
@@ -1396,6 +1411,11 @@ long xe_bo_shrink(struct ttm_operation_ctx *ctx, struct ttm_buffer_object *bo,
 
 	if (!xe_bo_is_xe_bo(bo) || !xe_bo_get_unless_zero(xe_bo))
 		return xe_bo_shrink_purge(ctx, bo, scanned);
+
+	if (xe_bo_has_dynamic_importer(xe_bo)) {
+		lret = -EBUSY;
+		goto out_unref;
+	}
 
 	if (xe_tt->purgeable) {
 		if (bo->resource->mem_type != XE_PL_SYSTEM)

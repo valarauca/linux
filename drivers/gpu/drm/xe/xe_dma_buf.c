@@ -27,6 +27,16 @@ static bool xe_dma_buf_has_p2p_provider(struct xe_device *xe)
 	return xe->mem.vram && xe->mem.vram->p2p_provider;
 }
 
+static int xe_dma_buf_require_cpu_visible(struct xe_bo *bo)
+{
+	if (bo->flags & XE_BO_FLAG_NEEDS_CPU_ACCESS)
+		return 0;
+
+	bo->flags |= XE_BO_FLAG_NEEDS_CPU_ACCESS;
+	return xe_bo_placement_for_flags(xe_bo_device(bo), bo, bo->flags,
+					 bo->ttm.type);
+}
+
 static int xe_dma_buf_attach(struct dma_buf *dmabuf,
 			     struct dma_buf_attachment *attach)
 {
@@ -88,12 +98,13 @@ static int xe_dma_buf_pin(struct dma_buf_attachment *attach)
 					ERR_PTR(ret));
 			return ret;
 		}
+	} else {
+		ret = xe_dma_buf_require_cpu_visible(bo);
+		if (ret)
+			return ret;
 	}
 
-	ret = xe_bo_pin_external(bo, !allow_vram, exec);
-	xe_assert(xe, !ret);
-
-	return 0;
+	return xe_bo_pin_external(bo, !allow_vram, exec);
 }
 
 static void xe_dma_buf_unpin(struct dma_buf_attachment *attach)
@@ -118,10 +129,13 @@ static struct sg_table *xe_dma_buf_map(struct dma_buf_attachment *attach,
 		return ERR_PTR(-EOPNOTSUPP);
 
 	if (!xe_bo_is_pinned(bo)) {
-		if (!attach->peer2peer)
+		if (!attach->peer2peer) {
 			r = xe_bo_migrate(bo, XE_PL_TT, NULL, exec);
-		else
-			r = xe_bo_validate(bo, NULL, false, exec);
+		} else {
+			r = xe_dma_buf_require_cpu_visible(bo);
+			if (!r)
+				r = xe_bo_validate(bo, NULL, false, exec);
+		}
 		if (r)
 			return ERR_PTR(r);
 	}
