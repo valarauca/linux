@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 #include "dma-buf.h"
 
 static inline void io_release_dmabuf(void *priv)
@@ -53,7 +54,7 @@ int io_register_dmabuf(struct io_ring_ctx *ctx,
 	imu->len = dmabuf->size;
 	imu->release = io_release_dmabuf;
 	imu->priv = bd;
-	imu->flags = IO_REGBUF_F_DMABUF | IO_REGBUF_F_UNCLONEABLE;
+	imu->flags = IO_REGBUF_F_DMABUF;
 	imu->dir = IO_BUF_DEST | IO_BUF_SOURCE;
 	dma_buf_put(dmabuf);
 	return 0;
