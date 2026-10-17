@@ -1608,6 +1608,11 @@ map_pages:
 				err = -EFAULT;
 				goto err_unmap;
 			}
+		} else if (is_pci_p2pdma_page(page) && ctx->p2pdma_map) {
+			err = ctx->p2pdma_map(svm_pages->drm, page, order,
+					      dma_dir, &svm_pages->dma_addr[j]);
+			if (err)
+				goto err_unmap;
 		} else {
 			dma_addr_t addr;
 
