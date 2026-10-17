@@ -456,6 +456,50 @@ int xe_vram_init_p2p_carveout(struct xe_tile *tile)
 }
 
 /**
+ * xe_vram_has_p2p_carveout() - Check whether any tile has a P2P carve-out
+ * @xe: the &xe_device
+ *
+ * Return: true if xe_vram_init_p2p_carveout() registered memory for any tile
+ */
+bool xe_vram_has_p2p_carveout(struct xe_device *xe)
+{
+	struct xe_tile *tile;
+	u8 id;
+
+	for_each_tile(tile, xe, id)
+		if (tile->mem.vram && tile->mem.vram->p2p_carveout_size)
+			return true;
+
+	return false;
+}
+
+/**
+ * xe_vram_p2p_carveout_mmap() - Map a new chunk of the P2P carve-out
+ * @xe: the &xe_device
+ * @vma: the shared userspace mapping to fill
+ *
+ * Allocate a zeroed chunk of the P2P carve-out the size of @vma and map its
+ * pages, so the mapping works as an O_DIRECT buffer and as a userptr. Access
+ * is governed by the DRM file the mapping was made through, and the chunk is
+ * freed once the mapping is gone and no I/O holds its pages. Unplugging the
+ * device zaps the mapping along with every other mapping of the DRM file.
+ *
+ * Return: 0 on success, negative error code on failure.
+ */
+int xe_vram_p2p_carveout_mmap(struct xe_device *xe, struct vm_area_struct *vma)
+{
+	if (!xe_vram_has_p2p_carveout(xe))
+		return -ENODEV;
+
+	if (vma_is_cow_mapping(vma))
+		return -EINVAL;
+
+	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
+
+	return pci_p2pmem_alloc_mmap(to_pci_dev(xe->drm.dev), vma, true);
+}
+
+/**
  * xe_vram_region_io_start - Get the IO start of a VRAM region
  * @vram: the VRAM region
  *
