@@ -13,6 +13,7 @@
 struct nvme_dma_buf_list {
 	struct list_head ctxs;
 	struct mutex lock;
+	bool removed;
 };
 
 struct nvme_dma_buf_io_ctx {
@@ -73,6 +74,7 @@ static inline void nvme_init_buf_list(struct nvme_dma_buf_list *buf_list)
 {
 	INIT_LIST_HEAD(&buf_list->ctxs);
 	mutex_init(&buf_list->lock);
+	buf_list->removed = false;
 }
 
 

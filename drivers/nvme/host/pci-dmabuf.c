@@ -116,10 +116,11 @@ void __nvme_pci_remove_dmabuf(struct nvme_dma_buf_list *list)
 		dma_buf_detach(ctx->base->dmabuf, ctx->attach);
 		list_del_init(&ctx->list);
 	}
+	list->removed = true;
 	mutex_unlock(&list->lock);
 }
 
-const struct dma_buf_io_ops nvme_dma_buf_io_ops = {
+static const struct dma_buf_io_ops nvme_dma_buf_io_ops = {
 	.map		= nvme_dma_buf_io_map,
 	.unmap		= nvme_dma_buf_io_unmap,
 	.release	= nvme_dma_buf_io_release,
@@ -131,6 +132,9 @@ static int nvme_init_io_ctx_locked(struct nvme_ctrl *ctrl,
 {
 	struct nvme_dma_buf_io_ctx *nvme_ctx;
 	struct dma_buf_attachment *attach;
+
+	if (buf_list->removed)
+		return -ENODEV;
 
 	nvme_ctx = kzalloc_obj(*nvme_ctx, GFP_KERNEL_ACCOUNT);
 	if (!nvme_ctx)

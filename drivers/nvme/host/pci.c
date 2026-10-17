@@ -1349,6 +1349,9 @@ static blk_status_t nvme_rq_setup_dmabuf(struct request *req,
 	unsigned int entries;
 	size_t avg_seg;
 
+	if (unlikely(blk_rq_payload_bytes(req) > NVME_MAX_BYTES))
+		return BLK_STS_IOERR;
+
 	seg = nvme_dmabuf_find_seg(nvme_req_to_map(req),
 				   req->bio->bi_iter.bi_offset);
 	if (unlikely(!seg))
@@ -1358,6 +1361,11 @@ static blk_status_t nvme_rq_setup_dmabuf(struct request *req,
 		return nvme_rq_setup_dmabuf_map(req, nvmeq, seg);
 
 	entries = nvme_pci_dmabuf_sgl_nents(req, seg);
+	if (unlikely(entries > NVME_MAX_SEGS)) {
+		if (use_sgl == SGL_FORCED)
+			return BLK_STS_IOERR;
+		return nvme_rq_setup_dmabuf_map(req, nvmeq, seg);
+	}
 
 	if (use_sgl == SGL_FORCED)
 		return nvme_rq_setup_dmabuf_sgl(req, nvmeq, seg, entries);
@@ -3717,6 +3725,7 @@ static void nvme_reset_work(struct work_struct *work)
 	nvme_sync_queues(&dev->ctrl);
 	nvme_mark_namespaces_dead(&dev->ctrl);
 	nvme_unquiesce_io_queues(&dev->ctrl);
+	nvme_pci_remove_dmabuf(&dev->dmabufs);
 	nvme_change_ctrl_state(&dev->ctrl, NVME_CTRL_DEAD);
 }
 
