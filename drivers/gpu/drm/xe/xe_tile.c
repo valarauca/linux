@@ -218,7 +218,7 @@ int xe_tile_init(struct xe_tile *tile)
 	if (IS_ERR(tile->mem.reclaim_pool))
 		return PTR_ERR(tile->mem.reclaim_pool);
 
-	return 0;
+	return xe_vram_init_p2p_carveout(tile);
 }
 void xe_tile_migrate_wait(struct xe_tile *tile)
 {
