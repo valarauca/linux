@@ -19,6 +19,7 @@
 #include <linux/iomap.h>
 #include <linux/module.h>
 #include <linux/io_uring/cmd.h>
+#include <linux/dma-buf-io.h>
 #include "blk.h"
 
 static inline struct inode *bdev_file_inode(struct file *file)
@@ -947,6 +948,10 @@ static int blkdev_init_dma_buf_io_ctx(struct file *file,
 
 	if (!(file->f_flags & O_DIRECT))
 		return -EINVAL;
+	if (ctx->dmabuf->size > UINT_MAX)
+		return -EINVAL;
+	if (blk_get_integrity(disk))
+		return -EOPNOTSUPP;
 	if (!disk->fops->init_dma_buf_io_ctx)
 		return -EOPNOTSUPP;
 	return disk->fops->init_dma_buf_io_ctx(bdev, ctx);

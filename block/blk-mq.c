@@ -3159,8 +3159,13 @@ void blk_mq_submit_bio(struct bio *bio)
 		goto queue_exit;
 
 	integrity_action = bio_integrity_action(bio);
-	if (integrity_action)
+	if (integrity_action) {
+		if (unlikely(op_is_dmabuf(bio->bi_opf))) {
+			bio_endio_status(bio, BLK_STS_NOTSUPP);
+			goto queue_exit;
+		}
 		bio_integrity_prep(bio, integrity_action);
+	}
 
 	blk_mq_bio_issue_init(q, bio);
 	if (blk_mq_attempt_bio_merge(q, bio, nr_segs))
