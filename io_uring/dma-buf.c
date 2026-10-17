@@ -4,8 +4,8 @@ static inline void io_release_dmabuf(void *priv)
 {
 	struct io_buf_dma *bd = priv;
 
-	fput(bd->target_file);
 	dma_buf_io_ctx_release(bd->ctx);
+	fput(bd->target_file);
 	kfree(bd);
 }
 
@@ -25,7 +25,7 @@ int io_register_dmabuf(struct io_ring_ctx *ctx,
 	if (desc->uaddr || desc->size)
 		return -EINVAL;
 
-	bd = kzalloc(sizeof(*bd), GFP_KERNEL);
+	bd = kzalloc(sizeof(*bd), GFP_KERNEL_ACCOUNT);
 	if (!bd)
 		return -ENOMEM;
 
@@ -53,7 +53,7 @@ int io_register_dmabuf(struct io_ring_ctx *ctx,
 	imu->len = dmabuf->size;
 	imu->release = io_release_dmabuf;
 	imu->priv = bd;
-	imu->flags = IO_REGBUF_F_DMABUF;
+	imu->flags = IO_REGBUF_F_DMABUF | IO_REGBUF_F_UNCLONEABLE;
 	imu->dir = IO_BUF_DEST | IO_BUF_SOURCE;
 	dma_buf_put(dmabuf);
 	return 0;
