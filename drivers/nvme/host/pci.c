@@ -9,6 +9,7 @@
 #include <linux/blkdev.h>
 #include <linux/blk-mq-dma.h>
 #include <linux/blk-integrity.h>
+#include <linux/bsearch.h>
 #include <linux/dmi.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
@@ -867,17 +868,45 @@ static void nvme_free_descriptors(struct request *req)
 	}
 }
 
+static int nvme_dmabuf_seg_cmp(const void *key, const void *elt)
+{
+	size_t offset = *(const size_t *)key;
+	const struct nvme_dmabuf_seg *seg = elt;
+
+	if (offset < seg->offset)
+		return -1;
+	if (offset - seg->offset >= seg->len)
+		return 1;
+	return 0;
+}
+
+static const struct nvme_dmabuf_seg *
+nvme_dmabuf_find_seg(struct nvme_dmabuf_map *map, size_t offset)
+{
+	return __inline_bsearch(&offset, map->segs, map->nr_segs,
+				sizeof(map->segs[0]), nvme_dmabuf_seg_cmp);
+}
+
+static dma_addr_t nvme_dmabuf_next_page(const struct nvme_dmabuf_seg **seg,
+		size_t *seg_off)
+{
+	*seg_off += NVME_CTRL_PAGE_SIZE;
+	if (*seg_off == (*seg)->len) {
+		(*seg)++;
+		*seg_off = 0;
+	}
+	return (*seg)->addr + *seg_off;
+}
+
 static blk_status_t nvme_rq_setup_dmabuf_map(struct request *req,
-		struct nvme_queue *nvmeq)
+		struct nvme_queue *nvmeq, const struct nvme_dmabuf_seg *seg)
 {
 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
-	struct nvme_dmabuf_map *map = nvme_req_to_map(req);
 	unsigned bvec_done = req->bio->bi_iter.bi_offset;
-	unsigned map_idx = bvec_done / NVME_CTRL_PAGE_SIZE;
 	unsigned offset = bvec_done & (NVME_CTRL_PAGE_SIZE - 1);
 	int length = blk_rq_payload_bytes(req) - (NVME_CTRL_PAGE_SIZE - offset);
-	dma_addr_t *dma_list = map->dma_list;
-	u64 prp1_dma = dma_list[map_idx++] + offset;
+	size_t seg_off = bvec_done - offset - seg->offset;
+	u64 prp1_dma = seg->addr + seg_off + offset;
 	u64 dma_addr, prp2_dma;
 	dma_addr_t prp_dma;
 	__le64 *prp_list;
@@ -889,7 +918,7 @@ static blk_status_t nvme_rq_setup_dmabuf_map(struct request *req,
 	}
 
 	if (length <= NVME_CTRL_PAGE_SIZE) {
-		prp2_dma = dma_list[map_idx];
+		prp2_dma = nvme_dmabuf_next_page(&seg, &seg_off);
 		goto done;
 	}
 
@@ -919,7 +948,7 @@ static blk_status_t nvme_rq_setup_dmabuf_map(struct request *req,
 			i = 1;
 		}
 
-		dma_addr = dma_list[map_idx++];
+		dma_addr = nvme_dmabuf_next_page(&seg, &seg_off);
 		prp_list[i++] = cpu_to_le64(dma_addr);
 
 		length -= NVME_CTRL_PAGE_SIZE;
@@ -1245,58 +1274,32 @@ static void nvme_pci_sgl_set_seg(struct nvme_sgl_desc *sge,
 	sge->type = NVME_SGL_FMT_LAST_SEG_DESC << 4;
 }
 
-static unsigned int nvme_pci_dmabuf_sgl_nents(struct request *req)
+static unsigned int nvme_pci_dmabuf_sgl_nents(struct request *req,
+		const struct nvme_dmabuf_seg *seg)
 {
-	struct bio *bio = req->bio;
-	struct nvme_dmabuf_map *map = to_nvme_dmabuf_map(bio->bi_dmabuf_map);
-	struct scatterlist *sg;
-	unsigned long tmp;
-	size_t offset = bio->bi_iter.bi_offset;
-	size_t remaining = blk_rq_payload_bytes(req);
-	unsigned int nents = 0;
+	size_t end = req->bio->bi_iter.bi_offset;
+	const struct nvme_dmabuf_seg *last;
 
-	for_each_sgtable_dma_sg(map->sgt, sg, tmp) {
-		size_t sg_len = sg_dma_len(sg);
-
-		if (!remaining)
-			break;
-		if (offset >= sg_len) {
-			offset -= sg_len;
-			continue;
-		}
-
-		sg_len -= offset;
-		offset = 0;
-
-		do {
-			size_t chunk = min(remaining, sg_len);
-
-			nents++;
-			sg_len -= chunk;
-			remaining -= chunk;
-		} while (sg_len && remaining);
-	}
-
-	if (unlikely(remaining))
+	end += blk_rq_payload_bytes(req);
+	last = nvme_dmabuf_find_seg(nvme_req_to_map(req), end - 1);
+	if (unlikely(!last))
 		return 0;
 
-	return nents;
+	return last - seg + 1;
 }
 
 static blk_status_t nvme_rq_setup_dmabuf_sgl(struct request *req,
-		struct nvme_queue *nvmeq, unsigned int entries)
+		struct nvme_queue *nvmeq, const struct nvme_dmabuf_seg *seg,
+		unsigned int entries)
 {
 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
-	struct nvme_dmabuf_map *map = nvme_req_to_map(req);
 	size_t length = blk_rq_payload_bytes(req);
 	struct nvme_sgl_desc *sg_list = &iod->cmd.common.dptr.sgl;
-	size_t offset = req->bio->bi_iter.bi_offset;
+	size_t seg_off = req->bio->bi_iter.bi_offset - seg->offset;
 	bool pooled = entries > 1;
 	dma_addr_t sgl_dma = 0;
-	unsigned int mapped = 0;
-	unsigned long tmp;
-	struct scatterlist *sg;
 	size_t remaining = length;
+	unsigned int i;
 
 	if (!entries)
 		return BLK_STS_IOERR;
@@ -1316,32 +1319,12 @@ static blk_status_t nvme_rq_setup_dmabuf_sgl(struct request *req,
 		iod->descriptors[iod->nr_descriptors++] = sg_list;
 	}
 
-	for_each_sgtable_dma_sg(map->sgt, sg, tmp) {
-		size_t sg_len = sg_dma_len(sg);
-		dma_addr_t addr = sg_dma_address(sg);
+	for (i = 0; i < entries; i++, seg++) {
+		u32 chunk = min_t(size_t, remaining, seg->len - seg_off);
 
-		if (!remaining)
-			break;
-		if (offset >= sg_len) {
-			offset -= sg_len;
-			continue;
-		}
-
-		addr += offset;
-		sg_len -= offset;
-		offset = 0;
-
-		do {
-			u32 chunk = min_t(size_t, remaining, sg_len);
-
-			if (WARN_ON_ONCE(mapped == entries))
-				goto err_free;
-			nvme_pci_sgl_set_data(&sg_list[mapped++], addr, chunk);
-
-			addr += chunk;
-			sg_len -= chunk;
-			remaining -= chunk;
-		} while (sg_len && remaining);
+		nvme_pci_sgl_set_data(&sg_list[i], seg->addr + seg_off, chunk);
+		remaining -= chunk;
+		seg_off = 0;
 	}
 
 	if (unlikely(remaining))
@@ -1349,7 +1332,7 @@ static blk_status_t nvme_rq_setup_dmabuf_sgl(struct request *req,
 
 	if (pooled)
 		nvme_pci_sgl_set_seg(&iod->cmd.common.dptr.sgl, sgl_dma,
-				     mapped);
+				     entries);
 	return BLK_STS_OK;
 err_free:
 	if (pooled) {
@@ -1362,23 +1345,29 @@ err_free:
 static blk_status_t nvme_rq_setup_dmabuf(struct request *req,
 		struct nvme_queue *nvmeq, enum nvme_use_sgl use_sgl)
 {
+	const struct nvme_dmabuf_seg *seg;
 	unsigned int entries;
 	size_t avg_seg;
 
-	if (use_sgl == SGL_UNSUPPORTED)
-		return nvme_rq_setup_dmabuf_map(req, nvmeq);
+	seg = nvme_dmabuf_find_seg(nvme_req_to_map(req),
+				   req->bio->bi_iter.bi_offset);
+	if (unlikely(!seg))
+		return BLK_STS_IOERR;
 
-	entries = nvme_pci_dmabuf_sgl_nents(req);
+	if (use_sgl == SGL_UNSUPPORTED)
+		return nvme_rq_setup_dmabuf_map(req, nvmeq, seg);
+
+	entries = nvme_pci_dmabuf_sgl_nents(req, seg);
 
 	if (use_sgl == SGL_FORCED)
-		return nvme_rq_setup_dmabuf_sgl(req, nvmeq, entries);
+		return nvme_rq_setup_dmabuf_sgl(req, nvmeq, seg, entries);
 
 	avg_seg = entries ?
 		DIV_ROUND_UP(blk_rq_payload_bytes(req), entries) : 0;
 	if (sgl_threshold && avg_seg >= sgl_threshold)
-		return nvme_rq_setup_dmabuf_sgl(req, nvmeq, entries);
+		return nvme_rq_setup_dmabuf_sgl(req, nvmeq, seg, entries);
 
-	return nvme_rq_setup_dmabuf_map(req, nvmeq);
+	return nvme_rq_setup_dmabuf_map(req, nvmeq, seg);
 }
 
 static blk_status_t nvme_pci_setup_data_sgl(struct request *req,
@@ -3578,9 +3567,6 @@ static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown)
 			nvme_unquiesce_admin_queue(&dev->ctrl);
 	}
 	mutex_unlock(&dev->shutdown_lock);
-
-	if (shutdown)
-		nvme_pci_remove_dmabuf(&dev->dmabufs);
 }
 
 static int nvme_disable_prepare_reset(struct nvme_dev *dev, bool shutdown)
@@ -4150,6 +4136,7 @@ static void nvme_remove(struct pci_dev *pdev)
 	nvme_stop_ctrl(&dev->ctrl);
 	nvme_remove_namespaces(&dev->ctrl);
 	nvme_dev_disable(dev, true);
+	nvme_pci_remove_dmabuf(&dev->dmabufs);
 	nvme_free_host_mem(dev);
 	nvme_dev_remove_admin(dev);
 	nvme_dbbuf_dma_free(dev);
