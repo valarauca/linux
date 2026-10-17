@@ -697,9 +697,10 @@ blkdev_direct_write(struct kiocb *iocb, struct iov_iter *from)
 
 	written = kiocb_invalidate_pages(iocb, count);
 	if (written) {
-		if (written == -EBUSY)
+		if (written != -EBUSY)
+			return written;
+		if (!iov_iter_is_dmabuf_map(from))
 			return 0;
-		return written;
 	}
 
 	written = blkdev_direct_IO(iocb, from);

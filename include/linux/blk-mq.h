@@ -1141,6 +1141,8 @@ static inline int blk_rq_cur_bytes(const struct request *rq)
 		return 0;
 	if (!bio_has_data(rq->bio))	/* dataless requests such as discard */
 		return rq->bio->bi_iter.bi_size;
+	if (op_is_dmabuf(rq->bio->bi_opf))
+		return rq->bio->bi_iter.bi_size;
 	return bio_iovec(rq->bio).bv_len;
 }
 

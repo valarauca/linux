@@ -350,6 +350,8 @@ static inline int bio_split_io_at_dmabuf(struct bio *bio,
 	 */
 	max_segs_bytes = (u64)lim->max_segments << seg_shift;
 	bytes = min_t(u64, bytes, max_segs_bytes - offset);
+	if (!bytes)
+		return -EINVAL;
 	if (bytes != bio->bi_iter.bi_size)
 		return bytes;
 	return 0;
@@ -543,6 +545,9 @@ unsigned int blk_recalc_rq_segments(struct request *rq)
 
 	if (!rq->bio)
 		return 0;
+
+	if (op_is_dmabuf(rq->bio->bi_opf))
+		return 1;
 
 	switch (bio_op(rq->bio)) {
 	case REQ_OP_DISCARD:
