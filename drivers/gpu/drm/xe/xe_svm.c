@@ -23,6 +23,7 @@
 #include "xe_ttm_vram_mgr.h"
 #include "xe_vm.h"
 #include "xe_vm_types.h"
+#include "xe_vram.h"
 #include "xe_vram_types.h"
 
 /* Identifies subclasses of struct drm_pagemap_peer */
@@ -1243,6 +1244,7 @@ static int __xe_svm_handle_pagefault(struct xe_vm *vm, struct xe_vma *vma,
 		.devmem_only = need_vram && devmem_possible,
 		.timeslice_ms = need_vram && devmem_possible ?
 			vm->xe->atomic_svm_timeslice_ms : 0,
+		.p2pdma_map = xe_vram_p2pdma_map,
 	};
 	struct xe_validation_ctx vctx;
 	struct drm_exec exec;

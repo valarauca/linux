@@ -3777,6 +3777,9 @@ int xe_gem_mmap_offset_ioctl(struct drm_device *dev, void *data,
 		if (XE_IOCTL_DBG(xe, args->handle))
 			return -EINVAL;
 
+		if (XE_IOCTL_DBG(xe, PAGE_SIZE > SZ_4K))
+			return -EINVAL;
+
 		if (!xe_vram_has_p2p_carveout(xe))
 			return -ENODEV;
 

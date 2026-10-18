@@ -940,11 +940,14 @@ struct drm_xe_gem_create {
  *    offset that allocates from the PCI P2PDMA carve-out set up with the
  *    p2p_carveout_mb module parameter. Every mmap at the returned offset
  *    allocates a new zeroed chunk of VRAM the size of the mapping, which
- *    must be shared. The mapping is backed by pages, so it can be used as an
- *    O_DIRECT read or write buffer and bound to the GPU with
- *    %DRM_XE_VM_BIND_OP_MAP_USERPTR. The chunk is freed once it is unmapped
- *    and any I/O using it has completed. Returns -ENODEV when the device has
- *    no carve-out.
+ *    must be shared. The chunk is charged to the caller's dmem cgroup
+ *    "p2p" region and mapped write-combined. The mapping is backed by pages,
+ *    so it can be used as an O_DIRECT read or write buffer and bound to the
+ *    GPU with %DRM_XE_VM_BIND_OP_MAP_USERPTR. The chunk is freed once every
+ *    mapping of it is gone and any I/O using it has completed. VRAM contents
+ *    don't survive system suspend, so suspend zaps every chunk mapping and
+ *    later accesses fault. Each mapping must be smaller than 4GiB minus the
+ *    offset. Returns -ENODEV when the device has no carve-out.
  *
  * .. code-block:: C
  *

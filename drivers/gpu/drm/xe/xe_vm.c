@@ -41,6 +41,7 @@
 #include "xe_tlb_inval.h"
 #include "xe_trace_bo.h"
 #include "xe_vm_madvise.h"
+#include "xe_vram.h"
 #include "xe_wa.h"
 
 static struct drm_gem_object *xe_vm_obj(struct xe_vm *vm)
@@ -3133,6 +3134,7 @@ static int prefetch_ranges(struct xe_vm *vm, struct xe_vma_op *op)
 	ctx.devmem_possible = devmem_possible;
 	ctx.check_pages_threshold = devmem_possible ? SZ_64K : 0;
 	ctx.device_private_page_owner = xe_svm_private_page_owner(vm, !dpagemap);
+	ctx.p2pdma_map = xe_vram_p2pdma_map;
 
 	/* TODO: Threading the migration */
 	xa_for_each(&op->prefetch_range.range, i, svm_range) {
