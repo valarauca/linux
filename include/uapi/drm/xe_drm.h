@@ -2639,15 +2639,19 @@ enum drm_xe_ras_error_component {
  * and any I/O using it has completed. Until then it keeps the device out of
  * runtime suspend.
  *
- * VRAM contents don't survive system suspend, so suspend revokes every chunk.
- * Later accesses to a revoked chunk fault, and it should be closed and
- * allocated again. Unbinding the device revokes chunks the same way.
+ * VRAM contents don't survive system suspend, so system suspend and
+ * hibernation fail with -EBUSY while any chunk's memory exists, including
+ * memory still pinned by I/O after its fd and mappings are gone. Unbinding
+ * the device, or a suspend outside normal system sleep such as kexec jump,
+ * revokes chunks instead. Later accesses to a revoked chunk fault, and it
+ * should be closed and allocated again.
  *
  * Compression-enabled PAT indices can't be used for CPU address mirror
  * bindings on a device with a carve-out, since carve-out VRAM is also
  * accessed uncompressed by the CPU and by other PCI devices.
  *
- * Returns -ENODEV when the device has no carve-out.
+ * Returns -ENODEV when the device has no carve-out, and -EBUSY while a
+ * system suspend is in progress.
  *
  * .. code-block:: C
  *

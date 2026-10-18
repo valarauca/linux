@@ -172,6 +172,7 @@ static void p2p_chunk_pages_released(struct pci_p2pmem_pages *pages)
 		container_of(pages, struct xe_p2p_chunk, pages);
 
 	dmem_cgroup_uncharge(chunk->pool, chunk->size);
+	atomic_dec(&p2p_vram(chunk->xe)->p2p_live);
 	queue_work(p2p_vram(chunk->xe)->p2p_wq, &chunk->release_work);
 }
 
@@ -192,13 +193,11 @@ static void p2p_chunk_put_pages(struct xe_p2p_chunk *chunk)
  *
  * Drop every chunk's own page references and zap its userspace mappings, so
  * that later accesses fault. Called once the device is unplugged, so unbind
- * doesn't wait on chunk fds that userspace still holds, and during system
- * suspend, since VRAM contents don't survive it. Suspend calls this before
- * evicting BOs, so the page-table BOs it backs up already have the PTEs zapped
- * by the resulting userptr and SVM invalidations, and while the GuC can still
- * process them. Each chunk's
- * memory, runtime PM reference and cgroup charge are released once in-flight
- * I/O has dropped its pins too.
+ * doesn't wait on chunk fds that userspace still holds. Normal system suspend
+ * is refused while chunks are live, see xe_p2p_carveout_pm_prepare(), so
+ * suspend only calls this through xe_p2p_carveout_suspend_fallback(). Each
+ * chunk's memory, runtime PM reference and cgroup charge are released once
+ * in-flight I/O has dropped its pins too.
  */
 void xe_p2p_carveout_revoke(struct xe_device *xe)
 {
@@ -217,6 +216,83 @@ void xe_p2p_carveout_revoke(struct xe_device *xe)
 		unmap_mapping_range(chunk->mapping, 0, 0, 1);
 	}
 	mutex_unlock(&vram->p2p_lock);
+}
+
+/**
+ * xe_p2p_carveout_pm_prepare() - Refuse system suspend while chunks are live
+ * @xe: the &xe_device
+ *
+ * Called from the PM notifier on PM_SUSPEND_PREPARE and
+ * PM_HIBERNATION_PREPARE, before userspace is frozen. VRAM contents don't
+ * survive suspend, and chunk pages may still be DMA targets of in-flight I/O,
+ * so suspend is refused while any chunk's memory hasn't gone back to the
+ * pool. Otherwise new allocations are blocked until
+ * xe_p2p_carveout_pm_complete().
+ *
+ * Return: 0 if suspend may proceed, -EBUSY if chunks are live.
+ */
+int xe_p2p_carveout_pm_prepare(struct xe_device *xe)
+{
+	struct xe_vram_region *vram;
+	int live;
+
+	if (!xe_p2p_carveout_available(xe))
+		return 0;
+
+	vram = p2p_vram(xe);
+	mutex_lock(&vram->p2p_lock);
+	live = atomic_read(&vram->p2p_live);
+	if (!live)
+		vram->p2p_suspending = true;
+	mutex_unlock(&vram->p2p_lock);
+
+	if (live) {
+		drm_info(&xe->drm, "refusing system suspend with %d P2P carve-out chunks live\n",
+			 live);
+		return -EBUSY;
+	}
+
+	return 0;
+}
+
+/**
+ * xe_p2p_carveout_pm_complete() - Allow carve-out allocations after suspend
+ * @xe: the &xe_device
+ *
+ * Called from the PM notifier on PM_POST_SUSPEND and PM_POST_HIBERNATION.
+ */
+void xe_p2p_carveout_pm_complete(struct xe_device *xe)
+{
+	struct xe_vram_region *vram;
+
+	if (!xe_p2p_carveout_available(xe))
+		return;
+
+	vram = p2p_vram(xe);
+	mutex_lock(&vram->p2p_lock);
+	vram->p2p_suspending = false;
+	mutex_unlock(&vram->p2p_lock);
+}
+
+/**
+ * xe_p2p_carveout_suspend_fallback() - Revoke chunks on unannounced suspend
+ * @xe: the &xe_device
+ *
+ * Some paths suspend the device without PM_SUSPEND_PREPARE or
+ * PM_HIBERNATION_PREPARE, such as kexec jump, the boot kernel's quiesce before
+ * restoring a hibernation image, and a suspend racing with probe before the
+ * PM notifier is registered. VRAM contents are lost there too, so revoke any
+ * live chunks so that later accesses fault. Normal system suspend never gets
+ * here with chunks live.
+ */
+void xe_p2p_carveout_suspend_fallback(struct xe_device *xe)
+{
+	if (!xe_p2p_carveout_available(xe) ||
+	    !atomic_read(&p2p_vram(xe)->p2p_live))
+		return;
+
+	drm_warn(&xe->drm, "revoking live P2P carve-out chunks on suspend\n");
+	xe_p2p_carveout_revoke(xe);
 }
 
 static struct page *p2p_chunk_page(struct xe_p2p_chunk *chunk,
@@ -360,9 +436,19 @@ int xe_p2p_alloc_ioctl(struct drm_device *dev, void *data,
 	if (args->size > vram->p2p_carveout_size)
 		return -ENOMEM;
 
+	mutex_lock(&vram->p2p_lock);
+	if (vram->p2p_suspending) {
+		mutex_unlock(&vram->p2p_lock);
+		return -EBUSY;
+	}
+	atomic_inc(&vram->p2p_live);
+	mutex_unlock(&vram->p2p_lock);
+
 	chunk = kzalloc_obj(*chunk, GFP_KERNEL_ACCOUNT);
-	if (!chunk)
+	if (!chunk) {
+		atomic_dec(&vram->p2p_live);
 		return -ENOMEM;
+	}
 	chunk->pages.release = p2p_chunk_pages_released;
 	INIT_WORK(&chunk->release_work, p2p_chunk_release_work);
 	refcount_set(&chunk->refs, 1);
@@ -375,6 +461,7 @@ int xe_p2p_alloc_ioctl(struct drm_device *dev, void *data,
 	    dmem_cgroup_try_charge(vram->p2p_carveout_cg, chunk->size,
 				   &chunk->pool, NULL)) {
 		kfree(chunk);
+		atomic_dec(&vram->p2p_live);
 		return -ENOMEM;
 	}
 
@@ -389,6 +476,7 @@ int xe_p2p_alloc_ioctl(struct drm_device *dev, void *data,
 		xe_pm_runtime_put(xe);
 		dmem_cgroup_uncharge(chunk->pool, chunk->size);
 		p2p_chunk_put(chunk);
+		atomic_dec(&vram->p2p_live);
 		return err;
 	}
 	refcount_inc(&chunk->refs);
