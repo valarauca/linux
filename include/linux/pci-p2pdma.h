@@ -84,7 +84,8 @@ struct scatterlist *pci_p2pmem_alloc_sgl(struct pci_dev *pdev,
 void pci_p2pmem_free_sgl(struct pci_dev *pdev, struct scatterlist *sgl);
 void pci_p2pmem_publish(struct pci_dev *pdev, bool publish);
 int pci_p2pmem_alloc_mmap(struct pci_dev *pdev, struct vm_area_struct *vma,
-			  bool zero);
+			  void (*clear)(void *data, phys_addr_t addr, size_t len),
+			  void *data);
 int pci_p2pdma_enable_store(const char *page, struct pci_dev **p2p_dev,
 			    bool *use_p2pdma);
 ssize_t pci_p2pdma_enable_show(char *page, struct pci_dev *p2p_dev,
@@ -142,7 +143,9 @@ static inline void pci_p2pmem_publish(struct pci_dev *pdev, bool publish)
 {
 }
 static inline int pci_p2pmem_alloc_mmap(struct pci_dev *pdev,
-		struct vm_area_struct *vma, bool zero)
+		struct vm_area_struct *vma,
+		void (*clear)(void *data, phys_addr_t addr, size_t len),
+		void *data)
 {
 	return -EOPNOTSUPP;
 }
