@@ -131,7 +131,7 @@ extern "C" {
 #define DRM_IOCTL_XE_VM_QUERY_MEM_RANGE_ATTRS	DRM_IOWR(DRM_COMMAND_BASE + DRM_XE_VM_QUERY_MEM_RANGE_ATTRS, struct drm_xe_vm_query_mem_range_attr)
 #define DRM_IOCTL_XE_EXEC_QUEUE_SET_PROPERTY	DRM_IOW(DRM_COMMAND_BASE + DRM_XE_EXEC_QUEUE_SET_PROPERTY, struct drm_xe_exec_queue_set_property)
 #define DRM_IOCTL_XE_VM_GET_PROPERTY		DRM_IOWR(DRM_COMMAND_BASE + DRM_XE_VM_GET_PROPERTY, struct drm_xe_vm_get_property)
-#define DRM_IOCTL_XE_P2P_ALLOC			DRM_IOWR(DRM_COMMAND_BASE + DRM_XE_P2P_ALLOC, struct drm_xe_p2p_alloc)
+#define DRM_IOCTL_XE_P2P_ALLOC			DRM_IOW(DRM_COMMAND_BASE + DRM_XE_P2P_ALLOC, struct drm_xe_p2p_alloc)
 
 /**
  * DOC: Xe IOCTL Extensions
@@ -2625,8 +2625,10 @@ enum drm_xe_ras_error_component {
  * struct drm_xe_p2p_alloc - Input of &DRM_IOCTL_XE_P2P_ALLOC
  *
  * Allocate a chunk of the PCI P2PDMA carve-out set up with the
- * p2p_carveout_mb module parameter, and return a new fd for it. The chunk is
- * zeroed and charged to the caller's dmem cgroup "p2p" region.
+ * p2p_carveout_mb module parameter. On success the ioctl returns a new fd for
+ * the chunk as its return value, rather than in the struct, so the fd can't
+ * be lost to a failed copy back to userspace. The chunk is zeroed and charged
+ * to the caller's dmem cgroup "p2p" region.
  *
  * Mapping the fd with mmap() and MAP_SHARED gives write-combined access to
  * the chunk, starting at the mmap offset. The mapping is backed by pages, so
@@ -2641,6 +2643,10 @@ enum drm_xe_ras_error_component {
  * Later accesses to a revoked chunk fault, and it should be closed and
  * allocated again. Unbinding the device revokes chunks the same way.
  *
+ * Compression-enabled PAT indices can't be used for CPU address mirror
+ * bindings on a device with a carve-out, since carve-out VRAM is also
+ * accessed uncompressed by the CPU and by other PCI devices.
+ *
  * Returns -ENODEV when the device has no carve-out.
  *
  * .. code-block:: C
@@ -2649,8 +2655,8 @@ enum drm_xe_ras_error_component {
  *         .size = size,
  *     };
  *
- *     err = ioctl(fd, DRM_IOCTL_XE_P2P_ALLOC, &alloc);
- *     buf = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, alloc.fd, 0);
+ *     chunk_fd = ioctl(fd, DRM_IOCTL_XE_P2P_ALLOC, &alloc);
+ *     buf = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, chunk_fd, 0);
  *     pread(file_opened_with_O_DIRECT, buf, size, file_offset);
  */
 struct drm_xe_p2p_alloc {
@@ -2663,8 +2669,8 @@ struct drm_xe_p2p_alloc {
 	/** @flags: Must be zero */
 	__u32 flags;
 
-	/** @fd: Returned fd of the chunk */
-	__s32 fd;
+	/** @pad: Must be zero */
+	__u32 pad;
 
 	/** @reserved: Reserved */
 	__u64 reserved[2];

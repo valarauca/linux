@@ -147,7 +147,7 @@ void *pci_p2pmem_alloc_pages(struct pci_dev *pdev, size_t size, size_t align,
 		struct page *page = virt_to_page(kaddr + off);
 
 		VM_WARN_ON_ONCE_PAGE(page_ref_count(page), page);
-		folio_set_zone_device_data(page_folio(page), pages);
+		page->zone_device_data = pages;
 		set_page_count(page, 1);
 		if (!(off & (SZ_2M - 1)))
 			cond_resched();
@@ -188,7 +188,6 @@ static int p2pmem_alloc_mmap(struct file *filp, struct kobject *kobj,
 	bool private;
 	size_t mapped = 0;
 	void *kaddr;
-	size_t off;
 	int ret = 0;
 
 	/* prevent private mappings from being established */
@@ -213,18 +212,9 @@ static int p2pmem_alloc_mmap(struct file *filp, struct kobject *kobj,
 	if (private)
 		return -EPERM;
 
-	kaddr = pci_p2pmem_alloc_pages(pdev, len,
-				       min_t(size_t, SZ_2M,
-					     rounddown_pow_of_two(len)),
-				       NULL);
+	kaddr = pci_p2pmem_alloc_pages(pdev, len, PAGE_SIZE, NULL);
 	if (IS_ERR(kaddr))
 		return PTR_ERR(kaddr);
-
-	for (off = 0; off < len; off += SZ_2M) {
-		memset_io((void __iomem __force *)(kaddr + off), 0,
-			  min_t(size_t, len - off, SZ_2M));
-		cond_resched();
-	}
 
 	while (mapped < len) {
 		unsigned long nr = min_t(unsigned long, P2PMEM_MMAP_BATCH,
@@ -283,10 +273,10 @@ static void p2pdma_folio_free(struct folio *folio)
 	/* safe to dereference while a reference is held to the percpu ref */
 	struct pci_p2pdma *p2pdma = rcu_dereference_protected(
 		to_pci_dev(pgmap->mem->owner)->p2pdma, 1);
-	struct pci_p2pmem_pages *pages = folio_zone_device_data(folio);
+	struct pci_p2pmem_pages *pages = page->zone_device_data;
 	struct percpu_ref *ref;
 
-	folio_set_zone_device_data(folio, NULL);
+	page->zone_device_data = NULL;
 	gen_pool_free_owner(p2pdma->pool, (uintptr_t)page_to_virt(page),
 			    PAGE_SIZE, (void **)&ref);
 	if (pages && atomic_long_dec_and_test(&pages->remaining))
@@ -1229,6 +1219,16 @@ enum pci_p2pdma_map_type pci_p2pdma_map_type(struct p2pdma_provider *provider,
 	return type;
 }
 
+/**
+ * __pci_p2pdma_update_state - update the P2P state for a P2PDMA page
+ * @state: P2P state to update
+ * @dev: device that transfers to or from @page
+ * @page: the P2PDMA page
+ *
+ * Helper for the inline pci_p2pdma_state(). It records @page's provider in
+ * @state and, if the provider changed, the map type between it and @dev.
+ * Callers should use pci_p2pdma_state() instead of calling this directly.
+ */
 void __pci_p2pdma_update_state(struct pci_p2pdma_map_state *state,
 		struct device *dev, struct page *page)
 {

@@ -5,6 +5,7 @@
 #include <linux/anon_inodes.h>
 #include <linux/cgroup_dmem.h>
 #include <linux/file.h>
+#include <linux/freezer.h>
 #include <linux/mm.h>
 #include <linux/pci.h>
 #include <linux/pci-p2pdma.h>
@@ -23,7 +24,7 @@
 #include "xe_svm.h"
 #include "xe_vram_types.h"
 
-#define P2P_FAULT_BATCH	64
+#define P2P_MIN_TTM_SIZE	SZ_1G
 
 struct xe_p2p_chunk {
 	struct pci_p2pmem_pages pages;
@@ -58,8 +59,8 @@ static void p2p_destroy_wq(void *wq)
  * the LMEM BAR with pci_p2pdma_add_resource(). The range gets ZONE_DEVICE
  * pages, which userspace allocates in chunks with DRM_IOCTL_XE_P2P_ALLOC.
  *
- * The carve-out needs a BAR covering all of VRAM and isn't offered on
- * platforms that need 64K VRAM pages. The memory stays unpublished and
+ * The carve-out needs a BAR covering all of VRAM, must leave TTM at least
+ * 1GiB, and isn't offered on platforms that need 64K VRAM pages. The memory stays unpublished and
  * private, so other P2PDMA users and the p2pmem sysfs allocator never get it.
  *
  * Failing to set up the carve-out is not fatal. The device then runs without
@@ -92,8 +93,8 @@ int xe_p2p_carveout_init(struct xe_tile *tile)
 	}
 
 	start = ALIGN_DOWN(vram->usable_size, SZ_2M);
-	if (size >= start) {
-		drm_warn(&xe->drm, "P2P carve-out of %lluMiB doesn't fit in VRAM\n",
+	if (size > start || start - size < P2P_MIN_TTM_SIZE) {
+		drm_warn(&xe->drm, "P2P carve-out of %lluMiB leaves too little VRAM\n",
 			 size / SZ_1M);
 		return 0;
 	}
@@ -196,8 +197,10 @@ static void p2p_chunk_put_pages(struct xe_p2p_chunk *chunk)
  * Drop every chunk's own page references and zap its userspace mappings, so
  * that later accesses fault. Called once the device is unplugged, so unbind
  * doesn't wait on chunk fds that userspace still holds, and during system
- * suspend while the GuC can still process the resulting userptr
- * invalidations, since VRAM contents don't survive suspend. Each chunk's
+ * suspend, since VRAM contents don't survive it. Suspend calls this before
+ * evicting BOs, so the page-table BOs it backs up already have the PTEs zapped
+ * by the resulting userptr and SVM invalidations, and while the GuC can still
+ * process them. Each chunk's
  * memory, runtime PM reference and cgroup charge are released once in-flight
  * I/O has dropped its pins too.
  */
@@ -229,34 +232,10 @@ static struct page *p2p_chunk_page(struct xe_p2p_chunk *chunk,
 	return virt_to_page(chunk->addr + (pgoff << PAGE_SHIFT));
 }
 
-static void p2p_chunk_insert_range(struct xe_p2p_chunk *chunk,
-				   struct vm_area_struct *vma,
-				   unsigned long start, unsigned long end)
-{
-	struct page *pages[P2P_FAULT_BATCH];
-
-	while (start < end) {
-		unsigned long nr = min_t(unsigned long, P2P_FAULT_BATCH,
-					 (end - start) >> PAGE_SHIFT);
-		unsigned long left = nr;
-		unsigned long i;
-
-		for (i = 0; i < nr; i++)
-			pages[i] = p2p_chunk_page(chunk, vma, start + i * PAGE_SIZE);
-
-		if (vm_insert_pages(vma, start, pages, &left))
-			return;
-		start += nr * PAGE_SIZE;
-	}
-}
-
 static vm_fault_t p2p_chunk_fault(struct vm_fault *vmf)
 {
 	struct vm_area_struct *vma = vmf->vma;
 	struct xe_p2p_chunk *chunk = vma->vm_file->private_data;
-	unsigned long window = ALIGN_DOWN(vmf->address, PMD_SIZE);
-	unsigned long start = max(window, vma->vm_start);
-	unsigned long end = min(window + PMD_SIZE, vma->vm_end);
 	vm_fault_t ret = VM_FAULT_SIGBUS;
 	int idx;
 
@@ -269,11 +248,6 @@ static vm_fault_t p2p_chunk_fault(struct vm_fault *vmf)
 
 	ret = vmf_insert_page_mkwrite(vmf, p2p_chunk_page(chunk, vma, vmf->address),
 				      false);
-	if (ret != VM_FAULT_NOPAGE)
-		goto out;
-
-	p2p_chunk_insert_range(chunk, vma, start, vmf->address);
-	p2p_chunk_insert_range(chunk, vma, vmf->address + PAGE_SIZE, end);
 out:
 	up_read(&chunk->lock);
 	drm_dev_exit(idx);
@@ -334,6 +308,7 @@ static int p2p_chunk_clear(struct xe_vram_region *vram,
 		if (fatal_signal_pending(current))
 			return -EINTR;
 
+		try_to_freeze();
 		if (!drm_dev_enter(&chunk->xe->drm, &idx))
 			return -ENODEV;
 
@@ -360,7 +335,10 @@ static int p2p_chunk_clear(struct xe_vram_region *vram,
  * its pins. Until then the chunk keeps its cgroup charge and keeps the device
  * out of runtime suspend.
  *
- * Return: 0 on success, negative error code on failure.
+ * The fd is the ioctl's return value rather than an output field, so no
+ * copy back to userspace can fail after it has been installed.
+ *
+ * Return: the new fd on success, negative error code on failure.
  */
 int xe_p2p_alloc_ioctl(struct drm_device *dev, void *data,
 		       struct drm_file *file)
@@ -372,7 +350,7 @@ int xe_p2p_alloc_ioctl(struct drm_device *dev, void *data,
 	struct file *filp;
 	int fd, idx, err;
 
-	if (XE_IOCTL_DBG(xe, args->extensions || args->flags ||
+	if (XE_IOCTL_DBG(xe, args->extensions || args->flags || args->pad ||
 			 args->reserved[0] || args->reserved[1]))
 		return -EINVAL;
 
@@ -400,8 +378,12 @@ int xe_p2p_alloc_ioctl(struct drm_device *dev, void *data,
 	if (vram->p2p_carveout_cg &&
 	    dmem_cgroup_try_charge(vram->p2p_carveout_cg, chunk->size,
 				   &chunk->pool, NULL)) {
-		kfree(chunk);
-		return -ENOMEM;
+		flush_workqueue(vram->p2p_wq);
+		if (dmem_cgroup_try_charge(vram->p2p_carveout_cg, chunk->size,
+					   &chunk->pool, NULL)) {
+			kfree(chunk);
+			return -ENOMEM;
+		}
 	}
 
 	drm_dev_get(dev);
@@ -449,8 +431,7 @@ int xe_p2p_alloc_ioctl(struct drm_device *dev, void *data,
 	drm_dev_exit(idx);
 
 	fd_install(fd, filp);
-	args->fd = fd;
-	return 0;
+	return fd;
 
 err_pages:
 	pci_p2pmem_put_pages(chunk->addr, chunk->size);
@@ -466,9 +447,10 @@ err_pages:
  * @dir: the DMA direction
  * @addr: returns the encoded address
  *
- * Pages of this device's carve-out are mapped by VRAM device physical
- * address. Pages of another device are mapped by bus address when the PCI
- * topology lets the two devices reach each other without the host bridge.
+ * Pages of this device's carve-out, recognized by address without a P2PDMA
+ * lookup, are mapped by VRAM device physical address. Pages of another
+ * device are mapped by bus address when the PCI topology lets the two
+ * devices reach each other without the host bridge.
  * Any other route needs a DMA mapping, which drm_gpusvm never unmaps, so it is
  * refused.
  *
@@ -478,21 +460,25 @@ int xe_p2p_carveout_map_page(struct drm_device *drm, struct page *page,
 			     unsigned int order, enum dma_data_direction dir,
 			     struct drm_pagemap_addr *addr)
 {
+	struct xe_vram_region *vram = p2p_vram(to_xe_device(drm));
 	struct pci_p2pdma_map_state state = {};
 	phys_addr_t phys = page_to_phys(page);
-	enum pci_p2pdma_map_type type;
+	resource_size_t start;
 
-	type = pci_p2pdma_state(&state, drm->dev, page);
-	if (state.mem && state.mem->owner == drm->dev) {
-		struct xe_vram_region *vram = p2p_vram(to_xe_device(drm));
-
-		*addr = drm_pagemap_addr_encode(vram->dpa_base + phys -
-						vram->io_start,
-						XE_INTERCONNECT_VRAM, order, dir);
-		return 0;
+	if (vram && vram->p2p_carveout_size) {
+		start = vram->io_start + vram->p2p_carveout_start;
+		if (phys >= start &&
+		    phys + (PAGE_SIZE << order) <= start + vram->p2p_carveout_size) {
+			*addr = drm_pagemap_addr_encode(vram->dpa_base + phys -
+							vram->io_start,
+							XE_INTERCONNECT_VRAM,
+							order, dir);
+			return 0;
+		}
 	}
 
-	if (type != PCI_P2PDMA_MAP_BUS_ADDR)
+	if (pci_p2pdma_state(&state, drm->dev, page) != PCI_P2PDMA_MAP_BUS_ADDR ||
+	    state.mem->owner == drm->dev)
 		return -EOPNOTSUPP;
 
 	*addr = drm_pagemap_addr_encode(pci_p2pdma_bus_addr_map(state.mem, phys),

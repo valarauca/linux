@@ -193,11 +193,11 @@ int xe_pm_suspend(struct xe_device *xe)
 	xe_display_pm_suspend(xe);
 
 	/* FIXME: Super racey... */
+	xe_p2p_carveout_revoke(xe);
+
 	err = xe_bo_evict_all(xe);
 	if (err)
 		goto err_display;
-
-	xe_p2p_carveout_revoke(xe);
 
 	for_each_gt(gt, xe, id) {
 		err = xe_gt_suspend(gt);
