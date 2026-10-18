@@ -118,6 +118,10 @@ void *pci_p2pmem_alloc_pages(struct pci_dev *pdev, size_t size, size_t align,
 	void *kaddr;
 	size_t off;
 
+	if (!size || !PAGE_ALIGNED(size) || align < PAGE_SIZE ||
+	    !is_power_of_2(align))
+		return ERR_PTR(-EINVAL);
+
 	rcu_read_lock();
 	p2pdma = rcu_dereference(pdev->p2pdma);
 	if (!p2pdma || !p2pdma->pool) {
@@ -188,6 +192,7 @@ static int p2pmem_alloc_mmap(struct file *filp, struct kobject *kobj,
 	bool private;
 	size_t mapped = 0;
 	void *kaddr;
+	size_t off;
 	int ret = 0;
 
 	/* prevent private mappings from being established */
@@ -215,6 +220,12 @@ static int p2pmem_alloc_mmap(struct file *filp, struct kobject *kobj,
 	kaddr = pci_p2pmem_alloc_pages(pdev, len, PAGE_SIZE, NULL);
 	if (IS_ERR(kaddr))
 		return PTR_ERR(kaddr);
+
+	for (off = 0; off < len; off += SZ_2M) {
+		memset_io((void __iomem __force *)(kaddr + off), 0,
+			  min_t(size_t, len - off, SZ_2M));
+		cond_resched();
+	}
 
 	while (mapped < len) {
 		unsigned long nr = min_t(unsigned long, P2PMEM_MMAP_BATCH,
