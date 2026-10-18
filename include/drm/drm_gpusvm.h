@@ -244,8 +244,9 @@ struct drm_gpusvm {
  * this operation
  * @p2pdma_map: Translate a PCI P2PDMA page into an address for the device,
  *              returning 0 or a negative error code (optional). P2PDMA pages
- *              are rejected when this is NULL. The address is never unmapped,
- *              so it must not hold DMA resources.
+ *              are rejected when this is NULL, when @devmem_only is set, and
+ *              when they share a range with device-private pages. The
+ *              address is never unmapped, so it must not hold DMA resources.
  * @check_pages_threshold: Check CPU pages for present if chunk is less than or
  *                         equal to threshold. If not present, reduce chunk
  *                         size.
