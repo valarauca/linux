@@ -89,28 +89,49 @@ static ssize_t published_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RO(published);
 
+#define P2PMEM_MMAP_BATCH	64
+
+static void p2pmem_clear(void *kaddr, size_t len)
+{
+	size_t off;
+
+	for (off = 0; off < len; off += SZ_2M) {
+		memset_io((void __iomem __force *)(kaddr + off), 0,
+			  min_t(size_t, len - off, SZ_2M));
+		cond_resched();
+	}
+}
+
 /**
  * pci_p2pmem_alloc_mmap - allocate p2pmem and map it into a userspace VMA
  * @pdev: the device providing the memory
  * @vma: the VMA to fill, which must be a shared mapping
- * @zero: clear the memory before mapping it
+ * @clear: clears the chunk before it is mapped, or NULL to clear it through
+ *	   the kernel's own mapping of the memory
+ * @data: passed to @clear
  *
- * Allocate a chunk of @pdev's p2pmem covering @vma and insert its pages, so
- * the mapping can be pinned with FOLL_PCI_P2PDMA and used for O_DIRECT. The
- * memory goes back to the pool once the VMA is unmapped and every other page
- * reference, such as a pin held by in-flight I/O, has been dropped. Pass
- * @zero when the pool is shared between users that must not see each
- * other's data.
+ * Allocate a zeroed chunk of @pdev's p2pmem covering @vma and insert its
+ * pages with @vma's page protection, so the mapping can be pinned with
+ * FOLL_PCI_P2PDMA and used for O_DIRECT. Chunks are aligned to their size,
+ * up to 2MiB. The memory goes back to the pool once the VMA is unmapped and
+ * every other page reference, such as a pin held by in-flight I/O, has been
+ * dropped. Drivers that have a write-combined mapping of the memory should
+ * pass @clear, since the kernel's mapping is uncached.
  *
  * Return: 0 on success, negative error code on failure.
  */
 int pci_p2pmem_alloc_mmap(struct pci_dev *pdev, struct vm_area_struct *vma,
-			  bool zero)
+			  void (*clear)(void *data, phys_addr_t addr, size_t len),
+			  void *data)
 {
 	size_t len = vma->vm_end - vma->vm_start;
+	struct genpool_data_align align = {
+		.align = min_t(size_t, SZ_2M, rounddown_pow_of_two(len)),
+	};
+	struct page *pages[P2PMEM_MMAP_BATCH];
 	struct pci_p2pdma *p2pdma;
 	struct percpu_ref *ref;
-	unsigned long vaddr;
+	size_t mapped = 0;
 	void *kaddr;
 	int ret;
 
@@ -124,12 +145,14 @@ int pci_p2pmem_alloc_mmap(struct pci_dev *pdev, struct vm_area_struct *vma,
 
 	rcu_read_lock();
 	p2pdma = rcu_dereference(pdev->p2pdma);
-	if (!p2pdma) {
+	if (!p2pdma || !p2pdma->pool) {
 		ret = -ENODEV;
 		goto out;
 	}
 
-	kaddr = (void *)gen_pool_alloc_owner(p2pdma->pool, len, (void **)&ref);
+	kaddr = (void *)gen_pool_alloc_algo_owner(p2pdma->pool, len,
+						  gen_pool_first_fit_align,
+						  &align, (void **)&ref);
 	if (!kaddr) {
 		ret = -ENOMEM;
 		goto out;
@@ -146,35 +169,47 @@ int pci_p2pmem_alloc_mmap(struct pci_dev *pdev, struct vm_area_struct *vma,
 	}
 	rcu_read_unlock();
 
-	for (vaddr = vma->vm_start; vaddr < vma->vm_end; vaddr += PAGE_SIZE) {
-		struct page *page = virt_to_page(kaddr);
+	if (clear)
+		clear(data, page_to_phys(virt_to_page(kaddr)), len);
+	else
+		p2pmem_clear(kaddr, len);
+
+	while (mapped < len) {
+		unsigned long nr = min_t(unsigned long, P2PMEM_MMAP_BATCH,
+					 (len - mapped) >> PAGE_SHIFT);
+		unsigned long left = nr;
+		unsigned long i;
 
 		/*
 		 * Initialise the refcount for the freshly allocated page. As
 		 * we have just allocated the page no one else should be
 		 * using it.
 		 */
-		VM_WARN_ON_ONCE_PAGE(page_ref_count(page), page);
-		if (zero)
-			memset(kaddr, 0, PAGE_SIZE);
-		set_page_count(page, 1);
-		ret = vm_insert_page(vma, vaddr, page);
-		if (ret) {
-			gen_pool_free(p2pdma->pool, (uintptr_t)kaddr, len);
+		for (i = 0; i < nr; i++) {
+			pages[i] = virt_to_page(kaddr + mapped + i * PAGE_SIZE);
+			VM_WARN_ON_ONCE_PAGE(page_ref_count(pages[i]), pages[i]);
+			set_page_count(pages[i], 1);
+		}
 
+		ret = vm_insert_pages(vma, vma->vm_start + mapped, pages, &left);
+		percpu_ref_get_many(ref, nr - left);
+		for (i = 0; i < nr - left; i++)
+			put_page(pages[i]);
+		mapped += (nr - left) * PAGE_SIZE;
+
+		if (ret) {
 			/*
 			 * Reset the page count. We don't use put_page()
 			 * because we don't want to trigger the
 			 * p2pdma_folio_free() path.
 			 */
-			set_page_count(page, 0);
+			for (i = nr - left; i < nr; i++)
+				set_page_count(pages[i], 0);
+			gen_pool_free(p2pdma->pool, (uintptr_t)kaddr + mapped,
+				      len - mapped);
 			percpu_ref_put(ref);
 			return ret;
 		}
-		percpu_ref_get(ref);
-		put_page(page);
-		kaddr += PAGE_SIZE;
-		len -= PAGE_SIZE;
 		cond_resched();
 	}
 
@@ -201,7 +236,7 @@ static int p2pmem_alloc_mmap(struct file *filp, struct kobject *kobj,
 		return -EINVAL;
 	}
 
-	return pci_p2pmem_alloc_mmap(pdev, vma, false);
+	return pci_p2pmem_alloc_mmap(pdev, vma, NULL, NULL);
 }
 
 static const struct bin_attribute p2pmem_alloc_attr = {
@@ -1172,6 +1207,7 @@ void __pci_p2pdma_update_state(struct pci_p2pdma_map_state *state,
 	state->mem = p2p_pgmap->mem;
 	state->map = pci_p2pdma_map_type(p2p_pgmap->mem, dev);
 }
+EXPORT_SYMBOL_GPL(__pci_p2pdma_update_state);
 
 /**
  * pci_p2pdma_enable_store - parse a configfs/sysfs attribute store

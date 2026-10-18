@@ -496,7 +496,7 @@ int xe_vram_p2p_carveout_mmap(struct xe_device *xe, struct vm_area_struct *vma)
 
 	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
 
-	return pci_p2pmem_alloc_mmap(to_pci_dev(xe->drm.dev), vma, true);
+	return pci_p2pmem_alloc_mmap(to_pci_dev(xe->drm.dev), vma, NULL, NULL);
 }
 
 /**
