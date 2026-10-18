@@ -30,6 +30,7 @@
 #include "xe_sysctrl.h"
 #include "xe_trace.h"
 #include "xe_vm.h"
+#include "xe_vram.h"
 #include "xe_wa.h"
 
 /**
@@ -183,6 +184,8 @@ int xe_pm_suspend(struct xe_device *xe)
 	err = xe_pxp_pm_suspend(xe->pxp);
 	if (err)
 		goto err;
+
+	xe_vram_p2p_carveout_suspend(xe);
 
 	xe_late_bind_wait_for_worker_completion(&xe->late_bind);
 

@@ -191,6 +191,10 @@ int xe_tile_init_noalloc(struct xe_tile *tile)
 		return err;
 
 	if (IS_DGFX(xe) && !ttm_resource_manager_used(&tile->mem.vram->ttm.manager)) {
+		err = xe_vram_init_p2p_carveout(tile);
+		if (err)
+			return err;
+
 		err = xe_ttm_vram_mgr_init(xe, tile->mem.vram);
 		if (err)
 			return err;
@@ -218,7 +222,7 @@ int xe_tile_init(struct xe_tile *tile)
 	if (IS_ERR(tile->mem.reclaim_pool))
 		return PTR_ERR(tile->mem.reclaim_pool);
 
-	return xe_vram_init_p2p_carveout(tile);
+	return 0;
 }
 void xe_tile_migrate_wait(struct xe_tile *tile)
 {

@@ -4,11 +4,15 @@
  */
 
 #include <kunit/visibility.h>
+#include <linux/cgroup_dmem.h>
 #include <linux/pci.h>
 #include <linux/pci-p2pdma.h>
 
+#include <drm/drm_drv.h>
 #include <drm/drm_managed.h>
+#include <drm/drm_pagemap.h>
 #include <drm/drm_print.h>
+#include <drm/drm_vma_manager.h>
 
 #include "regs/xe_bars.h"
 #include "regs/xe_gt_regs.h"
@@ -20,7 +24,9 @@
 #include "xe_gt_mcr.h"
 #include "xe_mmio.h"
 #include "xe_module.h"
+#include "xe_pm.h"
 #include "xe_sriov.h"
+#include "xe_svm.h"
 #include "xe_tile_sriov_vf.h"
 #include "xe_ttm_vram_mgr.h"
 #include "xe_vram.h"
@@ -375,28 +381,34 @@ int xe_vram_probe(struct xe_device *xe)
 	return devm_add_action_or_reset(xe->drm.dev, vram_fini, xe);
 }
 
-static void p2p_carveout_fini(void *arg)
-{
-	struct xe_vram_region *vram = arg;
+struct xe_p2p_chunk {
+	struct dmem_cgroup_pool_state *pool;
+	size_t size;
+	refcount_t refs;
+};
 
-	xe_bo_unpin_map_no_vm(vram->p2p_carveout);
-	vram->p2p_carveout = NULL;
-	vram->p2p_carveout_size = 0;
+static void p2p_carveout_pm_put(void *arg)
+{
+	xe_pm_runtime_put(arg);
 }
 
 /**
- * xe_vram_init_p2p_carveout() - Hand a fixed range of VRAM to PCI P2PDMA
- * @tile: the tile whose VRAM is carved
+ * xe_vram_init_p2p_carveout() - Hand the top of VRAM to PCI P2PDMA
+ * @tile: the tile being initialized
  *
- * Reserve xe_modparam.p2p_carveout_mb of VRAM, rounded up to 2MiB, at the
- * top of the tile's CPU visible VRAM with a pinned BO, then register the
- * matching part of the LMEM BAR with pci_p2pdma_add_resource(). The range
- * gets ZONE_DEVICE pages, so userspace can map it through the p2pmem sysfs
- * allocator and use it as an O_DIRECT target on any filesystem. The pinned
- * BO keeps TTM from ever placing or moving anything there.
+ * Must run before the tile's TTM VRAM manager is initialized. On the root
+ * tile, take xe_modparam.p2p_carveout_mb of VRAM, rounded up to 2MiB, off the
+ * top of VRAM so that TTM never manages it, and register the matching part of
+ * the LMEM BAR with pci_p2pdma_add_resource(). The range gets ZONE_DEVICE
+ * pages, which userspace allocates through xe_vram_p2p_carveout_mmap().
  *
- * Failing to register the range is not fatal. The device then runs without
- * a carve-out.
+ * The carve-out needs a BAR covering all of VRAM and isn't offered on
+ * platforms that need 64K VRAM pages. It keeps the device out of runtime
+ * suspend for as long as it exists, because the memory it hands out can be a
+ * DMA target at any time.
+ *
+ * Failing to set up the carve-out is not fatal. The device then runs without
+ * one and TTM manages all of VRAM.
  *
  * Return: 0 on success, negative error code on failure.
  */
@@ -406,37 +418,34 @@ int xe_vram_init_p2p_carveout(struct xe_tile *tile)
 	struct pci_dev *pdev = to_pci_dev(xe->drm.dev);
 	struct xe_vram_region *vram = tile->mem.vram;
 	u64 size = ALIGN((u64)xe_modparam.p2p_carveout_mb * SZ_1M, SZ_2M);
-	u64 start, end;
-	struct xe_bo *bo;
+	struct dmem_cgroup_region *cg;
+	u64 start;
 	int err;
 
-	if (!IS_DGFX(xe) || !size || !vram || !vram->p2p_provider)
+	if (!IS_DGFX(xe) || !size || tile != xe_device_get_root_tile(xe) ||
+	    !vram || !vram->p2p_provider)
 		return 0;
 
-	end = ALIGN_DOWN(min_t(u64, vram->usable_size, vram->io_size), SZ_2M);
-	if (size > end) {
-		drm_warn(&xe->drm, "VRAM[%u]: P2P carve-out of %lluMiB exceeds CPU visible VRAM\n",
-			 vram->id, size / SZ_1M);
-		return 0;
-	}
-	start = end - size;
-
-	bo = xe_bo_create_pin_range_novm(xe, tile, size, start, end,
-					 ttm_bo_type_kernel,
-					 XE_BO_FLAG_VRAM(vram) |
-					 XE_BO_FLAG_PINNED |
-					 XE_BO_FLAG_PINNED_LATE_RESTORE |
-					 XE_BO_FLAG_FORCE_USER_VRAM);
-	if (IS_ERR(bo)) {
-		drm_warn(&xe->drm, "VRAM[%u]: failed to reserve P2P carve-out: %pe\n",
-			 vram->id, bo);
+	if (xe->info.vram_flags & XE_VRAM_FLAGS_NEED64K) {
+		drm_warn(&xe->drm, "P2P carve-out is not supported on this platform\n");
 		return 0;
 	}
 
-	vram->p2p_carveout = bo;
-	vram->p2p_carveout_start = start;
-	vram->p2p_carveout_size = size;
-	err = devm_add_action_or_reset(xe->drm.dev, p2p_carveout_fini, vram);
+	if (vram->io_size < vram->usable_size) {
+		drm_warn(&xe->drm, "P2P carve-out needs a BAR covering all of VRAM\n");
+		return 0;
+	}
+
+	start = ALIGN_DOWN(vram->usable_size, SZ_2M);
+	if (size >= start) {
+		drm_warn(&xe->drm, "P2P carve-out of %lluMiB doesn't fit in VRAM\n",
+			 size / SZ_1M);
+		return 0;
+	}
+	start -= size;
+
+	xe_pm_runtime_get_noresume(xe);
+	err = devm_add_action_or_reset(xe->drm.dev, p2p_carveout_pm_put, xe);
 	if (err)
 		return err;
 
@@ -444,33 +453,74 @@ int xe_vram_init_p2p_carveout(struct xe_tile *tile)
 				      vram->io_start + start -
 				      pci_resource_start(pdev, LMEM_BAR));
 	if (err) {
-		drm_warn(&xe->drm, "VRAM[%u]: failed to register P2P carve-out: %pe\n",
-			 vram->id, ERR_PTR(err));
-		devm_release_action(xe->drm.dev, p2p_carveout_fini, vram);
+		drm_warn(&xe->drm, "failed to register P2P carve-out: %pe\n",
+			 ERR_PTR(err));
+		devm_release_action(xe->drm.dev, p2p_carveout_pm_put, xe);
 		return 0;
 	}
 
-	drm_info(&xe->drm, "VRAM[%u]: %lluMiB P2P carve-out at offset %#llx\n",
-		 vram->id, size / SZ_1M, start);
+	cg = drmm_cgroup_register_region(&xe->drm, "p2p",
+					 &(struct dmem_cgroup_init){
+						.size = size,
+					 });
+	if (IS_ERR(cg)) {
+		drm_warn(&xe->drm, "P2P carve-out has no cgroup region: %pe\n", cg);
+		cg = NULL;
+	}
+
+	vram->p2p_carveout_cg = cg;
+	vram->p2p_carveout_start = start;
+	vram->p2p_carveout_size = size;
+	drm_info(&xe->drm, "%lluMiB P2P carve-out at VRAM offset %#llx\n",
+		 size / SZ_1M, start);
 	return 0;
 }
 
 /**
- * xe_vram_has_p2p_carveout() - Check whether any tile has a P2P carve-out
+ * xe_vram_has_p2p_carveout() - Check whether the device has a P2P carve-out
  * @xe: the &xe_device
  *
- * Return: true if xe_vram_init_p2p_carveout() registered memory for any tile
+ * Return: true if xe_vram_init_p2p_carveout() set up a carve-out
  */
 bool xe_vram_has_p2p_carveout(struct xe_device *xe)
 {
-	struct xe_tile *tile;
-	u8 id;
+	struct xe_vram_region *vram = xe_device_get_root_tile(xe)->mem.vram;
 
-	for_each_tile(tile, xe, id)
-		if (tile->mem.vram && tile->mem.vram->p2p_carveout_size)
-			return true;
+	return vram && vram->p2p_carveout_size;
+}
 
-	return false;
+static void p2p_chunk_open(struct vm_area_struct *vma)
+{
+	struct xe_p2p_chunk *chunk = vma->vm_private_data;
+
+	refcount_inc(&chunk->refs);
+}
+
+static void p2p_chunk_close(struct vm_area_struct *vma)
+{
+	struct xe_p2p_chunk *chunk = vma->vm_private_data;
+
+	if (refcount_dec_and_test(&chunk->refs)) {
+		dmem_cgroup_uncharge(chunk->pool, chunk->size);
+		kfree(chunk);
+	}
+}
+
+static const struct vm_operations_struct p2p_chunk_vm_ops = {
+	.open = p2p_chunk_open,
+	.close = p2p_chunk_close,
+};
+
+static void p2p_chunk_clear(void *data, phys_addr_t addr, size_t len)
+{
+	struct xe_vram_region *vram = data;
+	void __iomem *va = vram->mapping + (addr - vram->io_start);
+	size_t off;
+
+	for (off = 0; off < len; off += SZ_2M) {
+		memset_io(va + off, 0, min_t(size_t, len - off, SZ_2M));
+		cond_resched();
+	}
 }
 
 /**
@@ -478,25 +528,128 @@ bool xe_vram_has_p2p_carveout(struct xe_device *xe)
  * @xe: the &xe_device
  * @vma: the shared userspace mapping to fill
  *
- * Allocate a zeroed chunk of the P2P carve-out the size of @vma and map its
- * pages, so the mapping works as an O_DIRECT buffer and as a userptr. Access
- * is governed by the DRM file the mapping was made through, and the chunk is
- * freed once the mapping is gone and no I/O holds its pages. Unplugging the
- * device zaps the mapping along with every other mapping of the DRM file.
+ * Allocate a zeroed chunk of the P2P carve-out the size of @vma, charge it to
+ * the caller's dmem cgroup and map its pages write-combined, so the mapping
+ * works as an O_DIRECT buffer and as a userptr. Access is governed by the DRM
+ * file the mapping was made through. The chunk is freed once every mapping of
+ * it is gone and no I/O holds its pages. Unplugging the device zaps the
+ * mapping along with every other mapping of the DRM file.
+ *
+ * A mapping must not reach the GEM fake offset range, so each chunk is limited
+ * to a little under 4GiB on 64-bit kernels.
  *
  * Return: 0 on success, negative error code on failure.
  */
 int xe_vram_p2p_carveout_mmap(struct xe_device *xe, struct vm_area_struct *vma)
 {
+	struct xe_vram_region *vram = xe_device_get_root_tile(xe)->mem.vram;
+	struct xe_p2p_chunk *chunk;
+	int idx, err;
+
 	if (!xe_vram_has_p2p_carveout(xe))
 		return -ENODEV;
 
-	if (vma_is_cow_mapping(vma))
+	if (vma->vm_pgoff + vma_pages(vma) > DRM_FILE_PAGE_OFFSET_START)
 		return -EINVAL;
 
-	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
+	chunk = kzalloc_obj(*chunk, GFP_KERNEL_ACCOUNT);
+	if (!chunk)
+		return -ENOMEM;
+	chunk->size = vma->vm_end - vma->vm_start;
+	refcount_set(&chunk->refs, 1);
 
-	return pci_p2pmem_alloc_mmap(to_pci_dev(xe->drm.dev), vma, NULL, NULL);
+	if (vram->p2p_carveout_cg &&
+	    dmem_cgroup_try_charge(vram->p2p_carveout_cg, chunk->size,
+				   &chunk->pool, NULL)) {
+		err = -ENOMEM;
+		goto err_free;
+	}
+
+	if (!drm_dev_enter(&xe->drm, &idx)) {
+		err = -ENODEV;
+		goto err_uncharge;
+	}
+
+	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
+	vma->vm_page_prot = pgprot_writecombine(vm_get_page_prot(vma->vm_flags));
+	err = pci_p2pmem_alloc_mmap(to_pci_dev(xe->drm.dev), vma,
+				    p2p_chunk_clear, vram);
+	drm_dev_exit(idx);
+	if (err)
+		goto err_uncharge;
+
+	vma->vm_private_data = chunk;
+	vma->vm_ops = &p2p_chunk_vm_ops;
+	return 0;
+
+err_uncharge:
+	dmem_cgroup_uncharge(chunk->pool, chunk->size);
+err_free:
+	kfree(chunk);
+	return err;
+}
+
+/**
+ * xe_vram_p2p_carveout_suspend() - Invalidate userspace carve-out mappings
+ * @xe: the &xe_device
+ *
+ * VRAM loses its contents across system suspend and the carve-out is not
+ * backed up. Zap every userspace mapping of it, so that later CPU access
+ * faults and userptr binds of it fail instead of silently reading garbage
+ * after resume.
+ */
+void xe_vram_p2p_carveout_suspend(struct xe_device *xe)
+{
+	if (!xe_vram_has_p2p_carveout(xe))
+		return;
+
+	unmap_mapping_range(xe->drm.anon_inode->i_mapping,
+			    XE_P2P_CARVEOUT_MMAP_OFFSET,
+			    ((loff_t)DRM_FILE_PAGE_OFFSET_START << PAGE_SHIFT) -
+			    XE_P2P_CARVEOUT_MMAP_OFFSET, 1);
+}
+
+/**
+ * xe_vram_p2pdma_map() - Translate a PCI P2PDMA page for GPU access
+ * @drm: the DRM device that accesses the page
+ * @page: the P2PDMA page
+ * @order: the order of @page
+ * @dir: the DMA direction
+ * @addr: returns the encoded address
+ *
+ * Pages of this device's carve-out are mapped by VRAM device physical
+ * address. Pages of another device are mapped by bus address when the PCI
+ * topology lets the two devices reach each other without the host bridge.
+ * Any other route needs a DMA mapping, which drm_gpusvm never unmaps, so it is
+ * refused.
+ *
+ * Return: 0 on success, -EOPNOTSUPP when the page can't be mapped.
+ */
+int xe_vram_p2pdma_map(struct drm_device *drm, struct page *page,
+		       unsigned int order, enum dma_data_direction dir,
+		       struct drm_pagemap_addr *addr)
+{
+	struct pci_p2pdma_map_state state = {};
+	phys_addr_t phys = page_to_phys(page);
+	enum pci_p2pdma_map_type type;
+
+	type = pci_p2pdma_state(&state, drm->dev, page);
+	if (state.mem && state.mem->owner == drm->dev) {
+		struct xe_vram_region *vram =
+			xe_device_get_root_tile(to_xe_device(drm))->mem.vram;
+
+		*addr = drm_pagemap_addr_encode(vram->dpa_base + phys -
+						vram->io_start,
+						XE_INTERCONNECT_VRAM, order, dir);
+		return 0;
+	}
+
+	if (type != PCI_P2PDMA_MAP_BUS_ADDR)
+		return -EOPNOTSUPP;
+
+	*addr = drm_pagemap_addr_encode(pci_p2pdma_bus_addr_map(state.mem, phys),
+					XE_INTERCONNECT_P2P, order, dir);
+	return 0;
 }
 
 /**

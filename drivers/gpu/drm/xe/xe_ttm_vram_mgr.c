@@ -387,15 +387,17 @@ int __xe_ttm_vram_mgr_init(struct xe_device *xe, struct xe_ttm_vram_mgr *mgr,
  * @xe: pointer to Xe device
  * @vram: pointer to xe_vram_region that contains the memory region attributes
  *
- * Initialize the Xe TTM for given @vram region using the given parameters.
+ * Initialize the Xe TTM for given @vram region using the given parameters,
+ * leaving out the P2P carve-out at the top of the region.
  *
  * Returns 0 for success, negative error code otherwise.
  */
 int xe_ttm_vram_mgr_init(struct xe_device *xe, struct xe_vram_region *vram)
 {
-	return __xe_ttm_vram_mgr_init(xe, &vram->ttm, vram->placement,
-				      xe_vram_region_usable_size(vram),
-				      xe_vram_region_io_size(vram),
+	u64 size = xe_vram_region_usable_size(vram) - vram->p2p_carveout_size;
+
+	return __xe_ttm_vram_mgr_init(xe, &vram->ttm, vram->placement, size,
+				      min_t(u64, xe_vram_region_io_size(vram), size),
 				      PAGE_SIZE);
 }
 

@@ -12,8 +12,8 @@
 
 #include "xe_ttm_vram_mgr_types.h"
 
+struct dmem_cgroup_region;
 struct p2pdma_provider;
-struct xe_bo;
 struct xe_device;
 struct xe_migrate;
 
@@ -73,18 +73,19 @@ struct xe_vram_region {
 	 */
 	struct p2pdma_provider *p2p_provider;
 	/**
-	 * @p2p_carveout: Pinned BO reserving the VRAM handed to PCI P2PDMA
+	 * @p2p_carveout_start: Offset of the PCI P2PDMA carve-out within this
+	 * region
 	 *
-	 * NULL unless the p2p_carveout_mb module parameter is set. The range
-	 * has ZONE_DEVICE pages, so userspace can map it through the PCI
-	 * p2pmem allocator, use it as an O_DIRECT target and bind the same
-	 * mapping to the GPU as a userptr.
+	 * The carve-out is VRAM at the top of the region that TTM never
+	 * manages. It has ZONE_DEVICE pages, so userspace can map chunks of it
+	 * through the render node, use them as O_DIRECT targets and bind the
+	 * same mappings to the GPU as userptrs.
 	 */
-	struct xe_bo *p2p_carveout;
-	/** @p2p_carveout_start: Offset of @p2p_carveout within this region */
 	resource_size_t p2p_carveout_start;
-	/** @p2p_carveout_size: Size of @p2p_carveout, 0 when there is none */
+	/** @p2p_carveout_size: Size of the carve-out, 0 when there is none */
 	resource_size_t p2p_carveout_size;
+	/** @p2p_carveout_cg: dmem cgroup region carve-out chunks are charged to */
+	struct dmem_cgroup_region *p2p_carveout_cg;
 #if IS_ENABLED(CONFIG_DRM_XE_PAGEMAP)
 	/** @migrate: Back pointer to migrate */
 	struct xe_migrate *migrate;
