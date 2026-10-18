@@ -44,11 +44,6 @@ static struct xe_vram_region *p2p_vram(struct xe_device *xe)
 	return xe_device_get_root_tile(xe)->mem.vram;
 }
 
-static void p2p_destroy_wq(void *wq)
-{
-	destroy_workqueue(wq);
-}
-
 /**
  * xe_p2p_carveout_init() - Hand the top of VRAM to PCI P2PDMA
  * @tile: the tile being initialized
@@ -63,7 +58,7 @@ static void p2p_destroy_wq(void *wq)
  * 1GiB, and isn't offered on platforms that need 64K VRAM pages. The memory stays unpublished and
  * private, so other P2PDMA users and the p2pmem sysfs allocator never get it.
  *
- * Failing to set up the carve-out is not fatal. The device then runs without
+ * Failing to set up the carve-out is never fatal. The device then runs without
  * one and TTM manages all of VRAM.
  *
  * Return: 0 on success, negative error code on failure.
@@ -101,17 +96,18 @@ int xe_p2p_carveout_init(struct xe_tile *tile)
 	start -= size;
 
 	err = drmm_mutex_init(&xe->drm, &vram->p2p_lock);
-	if (err)
-		return err;
+	if (err) {
+		drm_warn(&xe->drm, "P2P carve-out lock setup failed: %pe\n",
+			 ERR_PTR(err));
+		return 0;
+	}
 	INIT_LIST_HEAD(&vram->p2p_chunks);
 
-	vram->p2p_wq = alloc_workqueue("xe-p2p", WQ_UNBOUND, 0);
-	if (!vram->p2p_wq)
-		return -ENOMEM;
-
-	err = devm_add_action_or_reset(xe->drm.dev, p2p_destroy_wq, vram->p2p_wq);
-	if (err)
-		return err;
+	vram->p2p_wq = devm_alloc_workqueue(xe->drm.dev, "xe-p2p", WQ_UNBOUND, 0);
+	if (!vram->p2p_wq) {
+		drm_warn(&xe->drm, "P2P carve-out workqueue allocation failed\n");
+		return 0;
+	}
 
 	pci_p2pmem_set_private(pdev, true);
 	err = pci_p2pdma_add_resource(pdev, LMEM_BAR, size,
@@ -166,7 +162,6 @@ static void p2p_chunk_release_work(struct work_struct *work)
 	struct xe_p2p_chunk *chunk =
 		container_of(work, struct xe_p2p_chunk, release_work);
 
-	dmem_cgroup_uncharge(chunk->pool, chunk->size);
 	xe_pm_runtime_put(chunk->xe);
 	p2p_chunk_put(chunk);
 }
@@ -176,6 +171,7 @@ static void p2p_chunk_pages_released(struct pci_p2pmem_pages *pages)
 	struct xe_p2p_chunk *chunk =
 		container_of(pages, struct xe_p2p_chunk, pages);
 
+	dmem_cgroup_uncharge(chunk->pool, chunk->size);
 	queue_work(p2p_vram(chunk->xe)->p2p_wq, &chunk->release_work);
 }
 
@@ -378,12 +374,8 @@ int xe_p2p_alloc_ioctl(struct drm_device *dev, void *data,
 	if (vram->p2p_carveout_cg &&
 	    dmem_cgroup_try_charge(vram->p2p_carveout_cg, chunk->size,
 				   &chunk->pool, NULL)) {
-		flush_workqueue(vram->p2p_wq);
-		if (dmem_cgroup_try_charge(vram->p2p_carveout_cg, chunk->size,
-					   &chunk->pool, NULL)) {
-			kfree(chunk);
-			return -ENOMEM;
-		}
+		kfree(chunk);
+		return -ENOMEM;
 	}
 
 	drm_dev_get(dev);
@@ -454,7 +446,8 @@ err_pages:
  * Any other route needs a DMA mapping, which drm_gpusvm never unmaps, so it is
  * refused.
  *
- * Return: 0 on success, -EOPNOTSUPP when the page can't be mapped.
+ * Return: 0 on success, -EREMOTEIO when the page can't be mapped. That error
+ * is permanent, so SVM faults don't retry it.
  */
 int xe_p2p_carveout_map_page(struct drm_device *drm, struct page *page,
 			     unsigned int order, enum dma_data_direction dir,
@@ -479,7 +472,7 @@ int xe_p2p_carveout_map_page(struct drm_device *drm, struct page *page,
 
 	if (pci_p2pdma_state(&state, drm->dev, page) != PCI_P2PDMA_MAP_BUS_ADDR ||
 	    state.mem->owner == drm->dev)
-		return -EOPNOTSUPP;
+		return -EREMOTEIO;
 
 	*addr = drm_pagemap_addr_encode(pci_p2pdma_bus_addr_map(state.mem, phys),
 					XE_INTERCONNECT_P2P, order, dir);
