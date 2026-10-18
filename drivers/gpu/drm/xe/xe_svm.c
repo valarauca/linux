@@ -1254,6 +1254,7 @@ static int __xe_svm_handle_pagefault(struct xe_vm *vm, struct xe_vma *vma,
 	struct drm_pagemap *dpagemap;
 	struct xe_tile *tile = gt_to_tile(gt);
 	int migrate_try_count = ctx.devmem_only ? 3 : 1;
+	int get_pages_try_count = 3;
 	ktime_t start = xe_gt_stats_ktime_get(), bind_start, get_pages_start;
 	int err;
 
@@ -1332,16 +1333,17 @@ get_pages:
 	/* Corner where CPU mappings have changed */
 	if (err == -EOPNOTSUPP || err == -EFAULT || err == -EPERM) {
 		ctx.timeslice_ms <<= 1;	/* Double timeslice if we have to retry */
-		if (migrate_try_count > 0 || !ctx.devmem_only) {
+		if (migrate_try_count > 0 ||
+		    (!ctx.devmem_only && --get_pages_try_count > 0)) {
 			drm_dbg(&vm->xe->drm,
 				"Get pages failed, falling back to retrying, asid=%u, gpusvm=%p, errno=%pe\n",
 				vm->usm.asid, &vm->svm.gpusvm, ERR_PTR(err));
 			range_debug(range, "PAGE FAULT - RETRY PAGES");
 			goto retry;
 		} else {
-			drm_err(&vm->xe->drm,
-				"Get pages failed, retry count exceeded, asid=%u, gpusvm=%p, errno=%pe\n",
-				vm->usm.asid, &vm->svm.gpusvm, ERR_PTR(err));
+			drm_err_ratelimited(&vm->xe->drm,
+					    "Get pages failed, retry count exceeded, asid=%u, gpusvm=%p, errno=%pe\n",
+					    vm->usm.asid, &vm->svm.gpusvm, ERR_PTR(err));
 		}
 	}
 	if (err) {
