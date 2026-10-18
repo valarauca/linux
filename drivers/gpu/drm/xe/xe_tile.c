@@ -13,6 +13,7 @@
 #include "xe_ggtt.h"
 #include "xe_memirq.h"
 #include "xe_migrate.h"
+#include "xe_p2p_carveout.h"
 #include "xe_pcode.h"
 #include "xe_sa.h"
 #include "xe_svm.h"
@@ -191,7 +192,7 @@ int xe_tile_init_noalloc(struct xe_tile *tile)
 		return err;
 
 	if (IS_DGFX(xe) && !ttm_resource_manager_used(&tile->mem.vram->ttm.manager)) {
-		err = xe_vram_init_p2p_carveout(tile);
+		err = xe_p2p_carveout_init(tile);
 		if (err)
 			return err;
 

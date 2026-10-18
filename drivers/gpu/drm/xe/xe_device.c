@@ -54,6 +54,7 @@
 #include "xe_oa.h"
 #include "xe_observation.h"
 #include "xe_pagefault.h"
+#include "xe_p2p_carveout.h"
 #include "xe_pat.h"
 #include "xe_pcode.h"
 #include "xe_pm.h"
@@ -216,6 +217,7 @@ static const struct drm_ioctl_desc xe_ioctls[] = {
 			  DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(XE_VM_GET_PROPERTY, xe_vm_get_property_ioctl,
 			  DRM_RENDER_ALLOW),
+	DRM_IOCTL_DEF_DRV(XE_P2P_ALLOC, xe_p2p_alloc_ioctl, DRM_RENDER_ALLOW),
 };
 
 static long xe_drm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
@@ -357,8 +359,6 @@ static int xe_mmap(struct file *filp, struct vm_area_struct *vma)
 	switch (vma->vm_pgoff) {
 	case XE_PCI_BARRIER_MMAP_OFFSET >> XE_PTE_SHIFT:
 		return xe_pci_barrier_mmap(filp, vma);
-	case XE_P2P_CARVEOUT_MMAP_OFFSET >> XE_PTE_SHIFT:
-		return xe_vram_p2p_carveout_mmap(to_xe_device(dev), vma);
 	}
 
 	return drm_gem_mmap(filp, vma);
@@ -1168,6 +1168,8 @@ void xe_device_remove(struct xe_device *xe)
 	xe_display_unregister(xe);
 
 	drm_dev_unplug(&xe->drm);
+
+	xe_p2p_carveout_revoke(xe);
 
 	xe_bo_pci_dev_remove_all(xe);
 }

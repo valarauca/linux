@@ -14,6 +14,7 @@
 
 struct dmem_cgroup_region;
 struct p2pdma_provider;
+struct workqueue_struct;
 struct xe_device;
 struct xe_migrate;
 
@@ -77,15 +78,21 @@ struct xe_vram_region {
 	 * region
 	 *
 	 * The carve-out is VRAM at the top of the region that TTM never
-	 * manages. It has ZONE_DEVICE pages, so userspace can map chunks of it
-	 * through the render node, use them as O_DIRECT targets and bind the
-	 * same mappings to the GPU as userptrs.
+	 * manages. It has ZONE_DEVICE pages, so userspace can allocate chunks
+	 * of it with DRM_IOCTL_XE_P2P_ALLOC, use them as O_DIRECT targets and
+	 * bind the same mappings to the GPU as userptrs.
 	 */
 	resource_size_t p2p_carveout_start;
 	/** @p2p_carveout_size: Size of the carve-out, 0 when there is none */
 	resource_size_t p2p_carveout_size;
 	/** @p2p_carveout_cg: dmem cgroup region carve-out chunks are charged to */
 	struct dmem_cgroup_region *p2p_carveout_cg;
+	/** @p2p_chunks: Carve-out chunks allocated through the render node */
+	struct list_head p2p_chunks;
+	/** @p2p_lock: Protects @p2p_chunks */
+	struct mutex p2p_lock;
+	/** @p2p_wq: Releases chunks once all their memory is back in the pool */
+	struct workqueue_struct *p2p_wq;
 #if IS_ENABLED(CONFIG_DRM_XE_PAGEMAP)
 	/** @migrate: Back pointer to migrate */
 	struct xe_migrate *migrate;

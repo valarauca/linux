@@ -85,6 +85,7 @@ extern "C" {
  *  - &DRM_IOCTL_XE_VM_QUERY_MEM_RANGE_ATTRS
  *  - &DRM_IOCTL_XE_EXEC_QUEUE_SET_PROPERTY
  *  - &DRM_IOCTL_XE_VM_GET_PROPERTY
+ *  - &DRM_IOCTL_XE_P2P_ALLOC
  */
 
 /*
@@ -110,6 +111,7 @@ extern "C" {
 #define DRM_XE_VM_QUERY_MEM_RANGE_ATTRS	0x0d
 #define DRM_XE_EXEC_QUEUE_SET_PROPERTY	0x0e
 #define DRM_XE_VM_GET_PROPERTY		0x0f
+#define DRM_XE_P2P_ALLOC		0x10
 
 /* Must be kept compact -- no holes */
 
@@ -129,6 +131,7 @@ extern "C" {
 #define DRM_IOCTL_XE_VM_QUERY_MEM_RANGE_ATTRS	DRM_IOWR(DRM_COMMAND_BASE + DRM_XE_VM_QUERY_MEM_RANGE_ATTRS, struct drm_xe_vm_query_mem_range_attr)
 #define DRM_IOCTL_XE_EXEC_QUEUE_SET_PROPERTY	DRM_IOW(DRM_COMMAND_BASE + DRM_XE_EXEC_QUEUE_SET_PROPERTY, struct drm_xe_exec_queue_set_property)
 #define DRM_IOCTL_XE_VM_GET_PROPERTY		DRM_IOWR(DRM_COMMAND_BASE + DRM_XE_VM_GET_PROPERTY, struct drm_xe_vm_get_property)
+#define DRM_IOCTL_XE_P2P_ALLOC			DRM_IOWR(DRM_COMMAND_BASE + DRM_XE_P2P_ALLOC, struct drm_xe_p2p_alloc)
 
 /**
  * DOC: Xe IOCTL Extensions
@@ -935,30 +938,6 @@ struct drm_xe_gem_create {
  *     err = ioctl(fd, DRM_IOCTL_XE_GEM_MMAP_OFFSET, &mmo);
  *     map = mmap(NULL, size, PROT_WRITE, MAP_SHARED, fd, mmo.offset);
  *     map[i] = 0xdeadbeef; // issue barrier
- *
- *  - %DRM_XE_MMAP_OFFSET_FLAG_P2P_CARVEOUT - For user to query the special
- *    offset that allocates from the PCI P2PDMA carve-out set up with the
- *    p2p_carveout_mb module parameter. Every mmap at the returned offset
- *    allocates a new zeroed chunk of VRAM the size of the mapping, which
- *    must be shared. The chunk is charged to the caller's dmem cgroup
- *    "p2p" region and mapped write-combined. The mapping is backed by pages,
- *    so it can be used as an O_DIRECT read or write buffer and bound to the
- *    GPU with %DRM_XE_VM_BIND_OP_MAP_USERPTR. The chunk is freed once every
- *    mapping of it is gone and any I/O using it has completed. VRAM contents
- *    don't survive system suspend, so suspend zaps every chunk mapping and
- *    later accesses fault. Each mapping must be smaller than 4GiB minus the
- *    offset. Returns -ENODEV when the device has no carve-out.
- *
- * .. code-block:: C
- *
- *     struct drm_xe_gem_mmap_offset mmo = {
- *         .handle = 0, // must be set to 0
- *         .flags = DRM_XE_MMAP_OFFSET_FLAG_P2P_CARVEOUT,
- *     };
- *
- *     err = ioctl(fd, DRM_IOCTL_XE_GEM_MMAP_OFFSET, &mmo);
- *     buf = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, mmo.offset);
- *     pread(file_opened_with_O_DIRECT, buf, size, file_offset);
  */
 struct drm_xe_gem_mmap_offset {
 	/** @extensions: Pointer to the first extension struct, if any */
@@ -968,7 +947,6 @@ struct drm_xe_gem_mmap_offset {
 	__u32 handle;
 
 #define DRM_XE_MMAP_OFFSET_FLAG_PCI_BARRIER     (1 << 0)
-#define DRM_XE_MMAP_OFFSET_FLAG_P2P_CARVEOUT    (1 << 1)
 	/** @flags: Flags */
 	__u32 flags;
 
@@ -2642,6 +2620,55 @@ enum drm_xe_ras_error_component {
 	[DRM_XE_RAS_ERR_COMP_PCIE] = "pcie",				\
 	[DRM_XE_RAS_ERR_COMP_FABRIC] = "fabric",			\
 }
+
+/**
+ * struct drm_xe_p2p_alloc - Input of &DRM_IOCTL_XE_P2P_ALLOC
+ *
+ * Allocate a chunk of the PCI P2PDMA carve-out set up with the
+ * p2p_carveout_mb module parameter, and return a new fd for it. The chunk is
+ * zeroed and charged to the caller's dmem cgroup "p2p" region.
+ *
+ * Mapping the fd with mmap() and MAP_SHARED gives write-combined access to
+ * the chunk, starting at the mmap offset. The mapping is backed by pages, so
+ * it can be bound to the GPU with %DRM_XE_VM_BIND_OP_MAP_USERPTR and used as
+ * an O_DIRECT read or write buffer wherever the block device supports PCI
+ * P2PDMA, such as ext4 or XFS on NVMe or on md RAID 0, 1 or 10 of NVMe
+ * devices. The chunk is freed once the fd and every mapping of it are gone
+ * and any I/O using it has completed. Until then it keeps the device out of
+ * runtime suspend.
+ *
+ * VRAM contents don't survive system suspend, so suspend revokes every chunk.
+ * Later accesses to a revoked chunk fault, and it should be closed and
+ * allocated again. Unbinding the device revokes chunks the same way.
+ *
+ * Returns -ENODEV when the device has no carve-out.
+ *
+ * .. code-block:: C
+ *
+ *     struct drm_xe_p2p_alloc alloc = {
+ *         .size = size,
+ *     };
+ *
+ *     err = ioctl(fd, DRM_IOCTL_XE_P2P_ALLOC, &alloc);
+ *     buf = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, alloc.fd, 0);
+ *     pread(file_opened_with_O_DIRECT, buf, size, file_offset);
+ */
+struct drm_xe_p2p_alloc {
+	/** @extensions: Pointer to the first extension struct, if any */
+	__u64 extensions;
+
+	/** @size: Size of the chunk, a non-zero multiple of the page size */
+	__u64 size;
+
+	/** @flags: Must be zero */
+	__u32 flags;
+
+	/** @fd: Returned fd of the chunk */
+	__s32 fd;
+
+	/** @reserved: Reserved */
+	__u64 reserved[2];
+};
 
 #if defined(__cplusplus)
 }
