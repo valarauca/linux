@@ -1484,6 +1484,7 @@ int drm_gpusvm_get_pages(struct drm_gpusvm *gpusvm,
 	struct dev_pagemap *pagemap;
 	struct drm_pagemap *dpagemap;
 	bool p2pdma_mapped;
+	bool iova_tried;
 	struct drm_gpusvm_pages_flags flags;
 	enum dma_data_direction dma_dir = ctx->read_only ? DMA_TO_DEVICE :
 							   DMA_BIDIRECTIONAL;
@@ -1556,6 +1557,7 @@ map_pages:
 	zdd = NULL;
 	pagemap = NULL;
 	p2pdma_mapped = false;
+	iova_tried = false;
 	num_dma_mapped = 0;
 	for (i = 0, j = 0; i < npages; ++j) {
 		struct page *page = hmm_pfn_to_page(pfns[i]);
@@ -1645,9 +1647,11 @@ map_pages:
 				goto err_unmap;
 			}
 
-			if (!i)
+			if (!iova_tried) {
 				dma_iova_try_alloc(svm_pages->drm->dev, state,
 						   0, npages * PAGE_SIZE);
+				iova_tried = true;
+			}
 
 			if (dma_use_iova(state)) {
 				err = dma_iova_link(svm_pages->drm->dev, state,
