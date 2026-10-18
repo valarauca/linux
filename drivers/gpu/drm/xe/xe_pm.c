@@ -23,6 +23,7 @@
 #include "xe_i2c.h"
 #include "xe_irq.h"
 #include "xe_late_bind_fw.h"
+#include "xe_p2p_carveout.h"
 #include "xe_pcode.h"
 #include "xe_printk.h"
 #include "xe_pxp.h"
@@ -30,7 +31,6 @@
 #include "xe_sysctrl.h"
 #include "xe_trace.h"
 #include "xe_vm.h"
-#include "xe_vram.h"
 #include "xe_wa.h"
 
 /**
@@ -185,8 +185,6 @@ int xe_pm_suspend(struct xe_device *xe)
 	if (err)
 		goto err;
 
-	xe_vram_p2p_carveout_suspend(xe);
-
 	xe_late_bind_wait_for_worker_completion(&xe->late_bind);
 
 	for_each_gt(gt, xe, id)
@@ -198,6 +196,8 @@ int xe_pm_suspend(struct xe_device *xe)
 	err = xe_bo_evict_all(xe);
 	if (err)
 		goto err_display;
+
+	xe_p2p_carveout_revoke(xe);
 
 	for_each_gt(gt, xe, id) {
 		err = xe_gt_suspend(gt);

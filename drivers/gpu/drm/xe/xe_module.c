@@ -45,8 +45,8 @@ MODULE_PARM_DESC(probe_display, "Probe display HW, otherwise it's left untouched
 
 module_param_named(p2p_carveout_mb, xe_modparam.p2p_carveout_mb, uint, 0400);
 MODULE_PARM_DESC(p2p_carveout_mb, "Take this many MiB off the top of VRAM as PCI P2PDMA memory, "
-		 "rounded up to 2MiB. Needs a BAR covering all of VRAM and keeps the device "
-		 "out of runtime suspend [default=0]");
+		 "rounded up to 2MiB. Needs a BAR covering all of VRAM. Allocated chunks keep "
+		 "the device out of runtime suspend [default=0]");
 
 module_param_named(vram_bar_size, xe_modparam.force_vram_bar_size, int, 0600);
 MODULE_PARM_DESC(vram_bar_size, "Set the vram bar size in MiB (<0=disable-resize, 0=max-needed-size, >0=force-size "
