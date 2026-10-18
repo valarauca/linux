@@ -89,8 +89,18 @@ struct xe_vram_region {
 	struct dmem_cgroup_region *p2p_carveout_cg;
 	/** @p2p_chunks: Carve-out chunks allocated through the render node */
 	struct list_head p2p_chunks;
-	/** @p2p_lock: Protects @p2p_chunks */
+	/**
+	 * @p2p_lock: Protects @p2p_chunks and @p2p_suspending, and orders
+	 * increments of @p2p_live against the suspend check
+	 */
 	struct mutex p2p_lock;
+	/**
+	 * @p2p_live: Chunks whose memory hasn't fully gone back to the pool.
+	 * System suspend is refused while it is non-zero.
+	 */
+	atomic_t p2p_live;
+	/** @p2p_suspending: Set while a system suspend is in progress */
+	bool p2p_suspending;
 	/** @p2p_wq: Releases chunks once all their memory is back in the pool */
 	struct workqueue_struct *p2p_wq;
 #if IS_ENABLED(CONFIG_DRM_XE_PAGEMAP)

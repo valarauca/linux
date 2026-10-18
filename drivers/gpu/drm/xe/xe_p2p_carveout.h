@@ -16,6 +16,9 @@ struct xe_tile;
 int xe_p2p_carveout_init(struct xe_tile *tile);
 bool xe_p2p_carveout_available(struct xe_device *xe);
 void xe_p2p_carveout_revoke(struct xe_device *xe);
+int xe_p2p_carveout_pm_prepare(struct xe_device *xe);
+void xe_p2p_carveout_pm_complete(struct xe_device *xe);
+void xe_p2p_carveout_suspend_fallback(struct xe_device *xe);
 int xe_p2p_carveout_map_page(struct drm_device *drm, struct page *page,
 			     unsigned int order, enum dma_data_direction dir,
 			     struct drm_pagemap_addr *addr);
