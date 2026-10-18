@@ -5,6 +5,7 @@
 
 #include <kunit/visibility.h>
 #include <linux/pci.h>
+#include <linux/pci-p2pdma.h>
 
 #include <drm/drm_managed.h>
 #include <drm/drm_print.h>
@@ -38,9 +39,29 @@ static bool resource_is_valid(struct pci_dev *pdev, int bar)
 	return true;
 }
 
+static int determine_lmem_bar_p2p(struct xe_device *xe, struct xe_vram_region *lmem_bar)
+{
+	struct pci_dev *pdev = to_pci_dev(xe->drm.dev);
+	int err;
+
+	lmem_bar->p2p_provider = NULL;
+
+	err = pcim_p2pdma_init(pdev);
+	if (err == -EOPNOTSUPP) {
+		drm_info(&xe->drm, "VRAM BAR is not peer-to-peer capable\n");
+		return 0;
+	}
+	if (err)
+		return err;
+
+	lmem_bar->p2p_provider = pcim_p2pdma_provider(pdev, LMEM_BAR);
+	return 0;
+}
+
 static int determine_lmem_bar_size(struct xe_device *xe, struct xe_vram_region *lmem_bar)
 {
 	struct pci_dev *pdev = to_pci_dev(xe->drm.dev);
+	int err;
 
 	if (!resource_is_valid(pdev, LMEM_BAR)) {
 		drm_err(&xe->drm, "pci resource is not valid\n");
@@ -51,6 +72,10 @@ static int determine_lmem_bar_size(struct xe_device *xe, struct xe_vram_region *
 	lmem_bar->io_size = pci_resource_len(pdev, LMEM_BAR);
 	if (!lmem_bar->io_size)
 		return -EIO;
+
+	err = determine_lmem_bar_p2p(xe, lmem_bar);
+	if (err)
+		return err;
 
 	/* XXX: Need to change when xe link code is ready */
 	lmem_bar->dpa_base = 0;
@@ -260,6 +285,7 @@ static int vram_region_init(struct xe_device *xe, struct xe_vram_region *vram,
 	vram->dpa_base = lmem_bar->dpa_base + offset;
 	vram->mapping = lmem_bar->mapping + offset;
 	vram->usable_size = usable_size;
+	vram->p2p_provider = lmem_bar->p2p_provider;
 
 	print_vram_region_info(xe, vram);
 

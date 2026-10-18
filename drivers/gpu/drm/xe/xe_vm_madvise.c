@@ -9,6 +9,7 @@
 #include <drm/xe_drm.h>
 
 #include "xe_bo.h"
+#include "xe_p2p_carveout.h"
 #include "xe_pat.h"
 #include "xe_pt.h"
 #include "xe_svm.h"
@@ -499,6 +500,11 @@ static bool check_pat_args_are_sane(struct xe_device *xe,
 {
 	u16 coh_mode = xe_pat_index_get_coh_mode(xe, pat_index);
 	int i;
+
+	if (XE_IOCTL_DBG(xe, madvise_range->has_svm_userptr_vmas &&
+			 xe_pat_index_get_comp_en(xe, pat_index) &&
+			 xe_p2p_carveout_available(xe)))
+		return false;
 
 	/*
 	 * Using coh_none with CPU cached buffers is not allowed on iGPU.

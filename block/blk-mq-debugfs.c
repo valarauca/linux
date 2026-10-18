@@ -226,6 +226,7 @@ static const char *const cmd_flag_name[] = {
 	CMD_FLAG_NAME(DRV),
 	CMD_FLAG_NAME(FS_PRIVATE),
 	CMD_FLAG_NAME(ATOMIC),
+	CMD_FLAG_NAME(DMABUF),
 	CMD_FLAG_NAME(NOUNMAP),
 };
 #undef CMD_FLAG_NAME

@@ -28,6 +28,17 @@ struct p2pdma_provider {
 	u64 bus_offset;
 };
 
+/**
+ * struct pci_p2pmem_pages - tracks memory from pci_p2pmem_alloc_pages()
+ * @remaining: pages of the allocation that have not gone back to the pool
+ * @release: called once every page has gone back to the pool. It may run in
+ *	     atomic context.
+ */
+struct pci_p2pmem_pages {
+	atomic_long_t remaining;
+	void (*release)(struct pci_p2pmem_pages *pages);
+};
+
 enum pci_p2pdma_map_type {
 	/*
 	 * PCI_P2PDMA_MAP_UNKNOWN: Used internally as an initial state before
@@ -82,6 +93,10 @@ struct scatterlist *pci_p2pmem_alloc_sgl(struct pci_dev *pdev,
 					 unsigned int *nents, u32 length);
 void pci_p2pmem_free_sgl(struct pci_dev *pdev, struct scatterlist *sgl);
 void pci_p2pmem_publish(struct pci_dev *pdev, bool publish);
+void pci_p2pmem_set_private(struct pci_dev *pdev, bool private);
+void *pci_p2pmem_alloc_pages(struct pci_dev *pdev, size_t size, size_t align,
+			     struct pci_p2pmem_pages *pages);
+void pci_p2pmem_put_pages(void *addr, size_t size);
 int pci_p2pdma_enable_store(const char *page, struct pci_dev **p2p_dev,
 			    bool *use_p2pdma);
 ssize_t pci_p2pdma_enable_show(char *page, struct pci_dev *p2p_dev,
@@ -136,6 +151,17 @@ static inline void pci_p2pmem_free_sgl(struct pci_dev *pdev,
 {
 }
 static inline void pci_p2pmem_publish(struct pci_dev *pdev, bool publish)
+{
+}
+static inline void pci_p2pmem_set_private(struct pci_dev *pdev, bool private)
+{
+}
+static inline void *pci_p2pmem_alloc_pages(struct pci_dev *pdev, size_t size,
+		size_t align, struct pci_p2pmem_pages *pages)
+{
+	return ERR_PTR(-EOPNOTSUPP);
+}
+static inline void pci_p2pmem_put_pages(void *addr, size_t size)
 {
 }
 static inline int pci_p2pdma_enable_store(const char *page,

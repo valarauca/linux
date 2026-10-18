@@ -242,6 +242,11 @@ struct drm_gpusvm {
  *
  * @device_private_page_owner: The device-private page owner to use for
  * this operation
+ * @p2pdma_map: Translate a PCI P2PDMA page into an address for the device,
+ *              returning 0 or a negative error code (optional). P2PDMA pages
+ *              are rejected when this is NULL, when @devmem_only is set, and
+ *              when they share a range with device-private pages. The
+ *              address is never unmapped, so it must not hold DMA resources.
  * @check_pages_threshold: Check CPU pages for present if chunk is less than or
  *                         equal to threshold. If not present, reduce chunk
  *                         size.
@@ -259,6 +264,9 @@ struct drm_gpusvm {
  */
 struct drm_gpusvm_ctx {
 	void *device_private_page_owner;
+	int (*p2pdma_map)(struct drm_device *drm, struct page *page,
+			  unsigned int order, enum dma_data_direction dir,
+			  struct drm_pagemap_addr *addr);
 	unsigned long check_pages_threshold;
 	unsigned long timeslice_ms;
 	unsigned int in_notifier :1;

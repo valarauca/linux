@@ -104,6 +104,7 @@ xe-y += xe_bb.o \
 	xe_pci_error.o \
 	xe_pci_rebar.o \
 	xe_pcode.o \
+	xe_p2p_carveout.o \
 	xe_pm.o \
 	xe_preempt_fence.o \
 	xe_psmi.o \

@@ -24,6 +24,7 @@
 struct pci_p2pdma {
 	struct gen_pool *pool;
 	bool p2pmem_published;
+	bool p2pmem_private;
 	struct xarray map_types;
 	struct p2pdma_provider mem[PCI_STD_NUM_BARS];
 };
@@ -89,16 +90,110 @@ static ssize_t published_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RO(published);
 
+#define P2PMEM_MMAP_BATCH	64
+
+/**
+ * pci_p2pmem_alloc_pages - allocate p2pmem as individually refcounted pages
+ * @pdev: the device providing the memory
+ * @size: size of the allocation, a multiple of PAGE_SIZE
+ * @align: alignment of the allocation, a power of two of at least PAGE_SIZE
+ * @pages: tracks when the allocation has fully gone back to the pool, or NULL
+ *
+ * Unlike pci_alloc_p2pmem(), every page of the allocation starts with a page
+ * refcount of one owned by the caller, and goes back to the pool on its own
+ * once its refcount reaches zero. The pages can therefore be mapped into
+ * userspace and pinned by in-flight I/O independently of the caller. Drop the
+ * caller's references with pci_p2pmem_put_pages(). When @pages is given, its
+ * release callback runs once the last page has gone back to the pool.
+ *
+ * Context: Process context, may sleep.
+ * Return: the kernel address of the allocation, or an ERR_PTR() on failure.
+ */
+void *pci_p2pmem_alloc_pages(struct pci_dev *pdev, size_t size, size_t align,
+			     struct pci_p2pmem_pages *pages)
+{
+	struct genpool_data_align data = { .align = align };
+	struct pci_p2pdma *p2pdma;
+	struct percpu_ref *ref;
+	void *kaddr;
+	size_t off;
+
+	if (!size || !PAGE_ALIGNED(size) || align < PAGE_SIZE ||
+	    !is_power_of_2(align))
+		return ERR_PTR(-EINVAL);
+
+	rcu_read_lock();
+	p2pdma = rcu_dereference(pdev->p2pdma);
+	if (!p2pdma || !p2pdma->pool) {
+		rcu_read_unlock();
+		return ERR_PTR(-ENODEV);
+	}
+
+	kaddr = (void *)gen_pool_alloc_algo_owner(p2pdma->pool, size,
+						  gen_pool_first_fit_align,
+						  &data, (void **)&ref);
+	if (!kaddr) {
+		rcu_read_unlock();
+		return ERR_PTR(-ENOMEM);
+	}
+
+	if (unlikely(!percpu_ref_tryget_live_rcu(ref))) {
+		gen_pool_free(p2pdma->pool, (unsigned long)kaddr, size);
+		rcu_read_unlock();
+		return ERR_PTR(-ENODEV);
+	}
+	rcu_read_unlock();
+
+	if (pages)
+		atomic_long_set(&pages->remaining, size >> PAGE_SHIFT);
+
+	for (off = 0; off < size; off += PAGE_SIZE) {
+		struct page *page = virt_to_page(kaddr + off);
+
+		VM_WARN_ON_ONCE_PAGE(page_ref_count(page), page);
+		page->zone_device_data = pages;
+		set_page_count(page, 1);
+		if (!(off & (SZ_2M - 1)))
+			cond_resched();
+	}
+	percpu_ref_get_many(ref, (size >> PAGE_SHIFT) - 1);
+
+	return kaddr;
+}
+EXPORT_SYMBOL_GPL(pci_p2pmem_alloc_pages);
+
+/**
+ * pci_p2pmem_put_pages - drop the references from pci_p2pmem_alloc_pages()
+ * @addr: the address returned by pci_p2pmem_alloc_pages()
+ * @size: the size passed to pci_p2pmem_alloc_pages()
+ *
+ * Each page goes back to the pool once every other reference to it, such as
+ * a userspace mapping or a pin held by in-flight I/O, has been dropped too.
+ */
+void pci_p2pmem_put_pages(void *addr, size_t size)
+{
+	size_t off;
+
+	for (off = 0; off < size; off += PAGE_SIZE) {
+		put_page(virt_to_page(addr + off));
+		if (!(off & (SZ_2M - 1)))
+			cond_resched();
+	}
+}
+EXPORT_SYMBOL_GPL(pci_p2pmem_put_pages);
+
 static int p2pmem_alloc_mmap(struct file *filp, struct kobject *kobj,
 		const struct bin_attribute *attr, struct vm_area_struct *vma)
 {
 	struct pci_dev *pdev = to_pci_dev(kobj_to_dev(kobj));
 	size_t len = vma->vm_end - vma->vm_start;
+	struct page *pages[P2PMEM_MMAP_BATCH];
 	struct pci_p2pdma *p2pdma;
-	struct percpu_ref *ref;
-	unsigned long vaddr;
+	bool private;
+	size_t mapped = 0;
 	void *kaddr;
-	int ret;
+	size_t off;
+	int ret = 0;
 
 	/* prevent private mappings from being established */
 	if ((vma->vm_flags & VM_MAYSHARE) != VM_MAYSHARE) {
@@ -117,64 +212,38 @@ static int p2pmem_alloc_mmap(struct file *filp, struct kobject *kobj,
 
 	rcu_read_lock();
 	p2pdma = rcu_dereference(pdev->p2pdma);
-	if (!p2pdma) {
-		ret = -ENODEV;
-		goto out;
-	}
-
-	kaddr = (void *)gen_pool_alloc_owner(p2pdma->pool, len, (void **)&ref);
-	if (!kaddr) {
-		ret = -ENOMEM;
-		goto out;
-	}
-
-	/*
-	 * vm_insert_page() can sleep, so a reference is taken to mapping
-	 * such that rcu_read_unlock() can be done before inserting the
-	 * pages
-	 */
-	if (unlikely(!percpu_ref_tryget_live_rcu(ref))) {
-		ret = -ENODEV;
-		goto out_free_mem;
-	}
+	private = p2pdma && p2pdma->p2pmem_private;
 	rcu_read_unlock();
+	if (private)
+		return -EPERM;
 
-	for (vaddr = vma->vm_start; vaddr < vma->vm_end; vaddr += PAGE_SIZE) {
-		struct page *page = virt_to_page(kaddr);
+	kaddr = pci_p2pmem_alloc_pages(pdev, len, PAGE_SIZE, NULL);
+	if (IS_ERR(kaddr))
+		return PTR_ERR(kaddr);
 
-		/*
-		 * Initialise the refcount for the freshly allocated page. As
-		 * we have just allocated the page no one else should be
-		 * using it.
-		 */
-		VM_WARN_ON_ONCE_PAGE(page_ref_count(page), page);
-		set_page_count(page, 1);
-		ret = vm_insert_page(vma, vaddr, page);
-		if (ret) {
-			gen_pool_free(p2pdma->pool, (uintptr_t)kaddr, len);
-
-			/*
-			 * Reset the page count. We don't use put_page()
-			 * because we don't want to trigger the
-			 * p2pdma_folio_free() path.
-			 */
-			set_page_count(page, 0);
-			percpu_ref_put(ref);
-			return ret;
-		}
-		percpu_ref_get(ref);
-		put_page(page);
-		kaddr += PAGE_SIZE;
-		len -= PAGE_SIZE;
+	for (off = 0; off < len; off += SZ_2M) {
+		memset_io((void __iomem __force *)(kaddr + off), 0,
+			  min_t(size_t, len - off, SZ_2M));
+		cond_resched();
 	}
 
-	percpu_ref_put(ref);
+	while (mapped < len) {
+		unsigned long nr = min_t(unsigned long, P2PMEM_MMAP_BATCH,
+					 (len - mapped) >> PAGE_SHIFT);
+		unsigned long left = nr;
+		unsigned long i;
 
-	return 0;
-out_free_mem:
-	gen_pool_free(p2pdma->pool, (uintptr_t)kaddr, len);
-out:
-	rcu_read_unlock();
+		for (i = 0; i < nr; i++)
+			pages[i] = virt_to_page(kaddr + mapped + i * PAGE_SIZE);
+
+		ret = vm_insert_pages(vma, vma->vm_start + mapped, pages, &left);
+		mapped += (nr - left) * PAGE_SIZE;
+		if (ret)
+			break;
+		cond_resched();
+	}
+
+	pci_p2pmem_put_pages(kaddr, len);
 	return ret;
 }
 
@@ -215,10 +284,14 @@ static void p2pdma_folio_free(struct folio *folio)
 	/* safe to dereference while a reference is held to the percpu ref */
 	struct pci_p2pdma *p2pdma = rcu_dereference_protected(
 		to_pci_dev(pgmap->mem->owner)->p2pdma, 1);
+	struct pci_p2pmem_pages *pages = page->zone_device_data;
 	struct percpu_ref *ref;
 
+	page->zone_device_data = NULL;
 	gen_pool_free_owner(p2pdma->pool, (uintptr_t)page_to_virt(page),
 			    PAGE_SIZE, (void **)&ref);
+	if (pages && atomic_long_dec_and_test(&pages->remaining))
+		pages->release(pages);
 	percpu_ref_put(ref);
 }
 
@@ -1095,6 +1168,28 @@ void pci_p2pmem_publish(struct pci_dev *pdev, bool publish)
 EXPORT_SYMBOL_GPL(pci_p2pmem_publish);
 
 /**
+ * pci_p2pmem_set_private - keep p2pmem out of the sysfs allocator
+ * @pdev: the device with peer-to-peer DMA memory
+ * @private: true to refuse sysfs allocations, false to allow them again
+ *
+ * A driver that hands out its p2pmem through its own interface, with its own
+ * access control and accounting, can mark the memory private so that the
+ * p2pmem/allocate sysfs file never maps it. This is independent of
+ * pci_p2pmem_publish().
+ */
+void pci_p2pmem_set_private(struct pci_dev *pdev, bool private)
+{
+	struct pci_p2pdma *p2pdma;
+
+	rcu_read_lock();
+	p2pdma = rcu_dereference(pdev->p2pdma);
+	if (p2pdma)
+		p2pdma->p2pmem_private = private;
+	rcu_read_unlock();
+}
+EXPORT_SYMBOL_GPL(pci_p2pmem_set_private);
+
+/**
  * pci_p2pdma_map_type - Determine the mapping type for P2PDMA transfers
  * @provider: P2PDMA provider structure
  * @dev: Target device for the transfer
@@ -1135,6 +1230,16 @@ enum pci_p2pdma_map_type pci_p2pdma_map_type(struct p2pdma_provider *provider,
 	return type;
 }
 
+/**
+ * __pci_p2pdma_update_state - update the P2P state for a P2PDMA page
+ * @state: P2P state to update
+ * @dev: device that transfers to or from @page
+ * @page: the P2PDMA page
+ *
+ * Helper for the inline pci_p2pdma_state(). It records @page's provider in
+ * @state and, if the provider changed, the map type between it and @dev.
+ * Callers should use pci_p2pdma_state() instead of calling this directly.
+ */
 void __pci_p2pdma_update_state(struct pci_p2pdma_map_state *state,
 		struct device *dev, struct page *page)
 {
@@ -1146,6 +1251,7 @@ void __pci_p2pdma_update_state(struct pci_p2pdma_map_state *state,
 	state->mem = p2p_pgmap->mem;
 	state->map = pci_p2pdma_map_type(p2p_pgmap->mem, dev);
 }
+EXPORT_SYMBOL_GPL(__pci_p2pdma_update_state);
 
 /**
  * pci_p2pdma_enable_store - parse a configfs/sysfs attribute store
