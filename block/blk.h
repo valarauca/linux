@@ -402,7 +402,7 @@ static inline bool bio_may_need_split(struct bio *bio,
 	if (lim->chunk_sectors)
 		return true;
 
-	if (!bio->bi_io_vec)
+	if (!bio->bi_io_vec || op_is_dmabuf(bio->bi_opf))
 		return true;
 
 	bv = __bvec_iter_bvec(bio->bi_io_vec, bio->bi_iter);

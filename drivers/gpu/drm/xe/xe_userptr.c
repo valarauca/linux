@@ -8,6 +8,7 @@
 
 #include <linux/mm.h>
 
+#include "xe_p2p_carveout.h"
 #include "xe_tlb_inval.h"
 #include "xe_trace_bo.h"
 
@@ -65,6 +66,7 @@ int xe_vma_userptr_pin_pages(struct xe_userptr_vma *uvma)
 	struct drm_gpusvm_ctx ctx = {
 		.read_only = xe_vma_read_only(vma),
 		.device_private_page_owner = xe_svm_private_page_owner(vm, false),
+		.p2pdma_map = xe_p2p_carveout_map_page,
 		.allow_mixed = true,
 	};
 

@@ -23,6 +23,7 @@
 #include "xe_i2c.h"
 #include "xe_irq.h"
 #include "xe_late_bind_fw.h"
+#include "xe_p2p_carveout.h"
 #include "xe_pcode.h"
 #include "xe_printk.h"
 #include "xe_pxp.h"
@@ -190,6 +191,8 @@ int xe_pm_suspend(struct xe_device *xe)
 		xe_gt_suspend_prepare(gt);
 
 	xe_display_pm_suspend(xe);
+
+	xe_p2p_carveout_suspend_fallback(xe);
 
 	/* FIXME: Super racey... */
 	err = xe_bo_evict_all(xe);
@@ -440,6 +443,10 @@ static int xe_pm_notifier_callback(struct notifier_block *nb,
 	{
 		struct xe_validation_ctx ctx;
 
+		err = xe_p2p_carveout_pm_prepare(xe);
+		if (err)
+			return notifier_from_errno(err);
+
 		reinit_completion(&xe->pm_block);
 		xe_pm_block_begin_signalling();
 		xe_pm_runtime_get(xe);
@@ -463,6 +470,7 @@ static int xe_pm_notifier_callback(struct notifier_block *nb,
 	}
 	case PM_POST_HIBERNATION:
 	case PM_POST_SUSPEND:
+		xe_p2p_carveout_pm_complete(xe);
 		complete_all(&xe->pm_block);
 		xe_pm_wake_rebind_workers(xe);
 		xe_bo_notifier_unprepare_all_pinned(xe);

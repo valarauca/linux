@@ -85,6 +85,7 @@ extern "C" {
  *  - &DRM_IOCTL_XE_VM_QUERY_MEM_RANGE_ATTRS
  *  - &DRM_IOCTL_XE_EXEC_QUEUE_SET_PROPERTY
  *  - &DRM_IOCTL_XE_VM_GET_PROPERTY
+ *  - &DRM_IOCTL_XE_P2P_ALLOC
  */
 
 /*
@@ -110,6 +111,7 @@ extern "C" {
 #define DRM_XE_VM_QUERY_MEM_RANGE_ATTRS	0x0d
 #define DRM_XE_EXEC_QUEUE_SET_PROPERTY	0x0e
 #define DRM_XE_VM_GET_PROPERTY		0x0f
+#define DRM_XE_P2P_ALLOC		0x10
 
 /* Must be kept compact -- no holes */
 
@@ -129,6 +131,7 @@ extern "C" {
 #define DRM_IOCTL_XE_VM_QUERY_MEM_RANGE_ATTRS	DRM_IOWR(DRM_COMMAND_BASE + DRM_XE_VM_QUERY_MEM_RANGE_ATTRS, struct drm_xe_vm_query_mem_range_attr)
 #define DRM_IOCTL_XE_EXEC_QUEUE_SET_PROPERTY	DRM_IOW(DRM_COMMAND_BASE + DRM_XE_EXEC_QUEUE_SET_PROPERTY, struct drm_xe_exec_queue_set_property)
 #define DRM_IOCTL_XE_VM_GET_PROPERTY		DRM_IOWR(DRM_COMMAND_BASE + DRM_XE_VM_GET_PROPERTY, struct drm_xe_vm_get_property)
+#define DRM_IOCTL_XE_P2P_ALLOC			DRM_IOW(DRM_COMMAND_BASE + DRM_XE_P2P_ALLOC, struct drm_xe_p2p_alloc)
 
 /**
  * DOC: Xe IOCTL Extensions
@@ -2617,6 +2620,65 @@ enum drm_xe_ras_error_component {
 	[DRM_XE_RAS_ERR_COMP_PCIE] = "pcie",				\
 	[DRM_XE_RAS_ERR_COMP_FABRIC] = "fabric",			\
 }
+
+/**
+ * struct drm_xe_p2p_alloc - Input of &DRM_IOCTL_XE_P2P_ALLOC
+ *
+ * Allocate a chunk of the PCI P2PDMA carve-out set up with the
+ * p2p_carveout_mb module parameter. On success the ioctl returns a new fd for
+ * the chunk as its return value, rather than in the struct, so the fd can't
+ * be lost to a failed copy back to userspace. The chunk is zeroed and charged
+ * to the caller's dmem cgroup "p2p" region.
+ *
+ * Mapping the fd with mmap() and MAP_SHARED gives write-combined access to
+ * the chunk, starting at the mmap offset. The mapping is backed by pages, so
+ * it can be bound to the GPU with %DRM_XE_VM_BIND_OP_MAP_USERPTR and used as
+ * an O_DIRECT read or write buffer wherever the block device supports PCI
+ * P2PDMA, such as ext4 or XFS on NVMe or on md RAID 0, 1 or 10 of NVMe
+ * devices. The chunk is freed once the fd and every mapping of it are gone
+ * and any I/O using it has completed. Until then it keeps the device out of
+ * runtime suspend.
+ *
+ * VRAM contents don't survive system suspend, so system suspend and
+ * hibernation fail with -EBUSY while any chunk's memory exists, including
+ * memory still pinned by I/O after its fd and mappings are gone. Unbinding
+ * the device, or a suspend outside normal system sleep such as kexec jump,
+ * revokes chunks instead. Later accesses to a revoked chunk fault, and it
+ * should be closed and allocated again.
+ *
+ * Compression-enabled PAT indices can't be used for CPU address mirror
+ * bindings on a device with a carve-out, since carve-out VRAM is also
+ * accessed uncompressed by the CPU and by other PCI devices.
+ *
+ * Returns -ENODEV when the device has no carve-out, and -EBUSY while a
+ * system suspend is in progress.
+ *
+ * .. code-block:: C
+ *
+ *     struct drm_xe_p2p_alloc alloc = {
+ *         .size = size,
+ *     };
+ *
+ *     chunk_fd = ioctl(fd, DRM_IOCTL_XE_P2P_ALLOC, &alloc);
+ *     buf = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, chunk_fd, 0);
+ *     pread(file_opened_with_O_DIRECT, buf, size, file_offset);
+ */
+struct drm_xe_p2p_alloc {
+	/** @extensions: Pointer to the first extension struct, if any */
+	__u64 extensions;
+
+	/** @size: Size of the chunk, a non-zero multiple of the page size */
+	__u64 size;
+
+	/** @flags: Must be zero */
+	__u32 flags;
+
+	/** @pad: Must be zero */
+	__u32 pad;
+
+	/** @reserved: Reserved */
+	__u64 reserved[2];
+};
 
 #if defined(__cplusplus)
 }

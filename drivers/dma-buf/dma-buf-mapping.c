@@ -146,7 +146,7 @@ struct sg_table *dma_buf_phys_vec_to_sgt(struct dma_buf_attachment *attach,
 	/* sg_alloc_table will cleanly fail and return -EINVAL if nents == 0 */
 	ret = sg_alloc_table(&dma->sgt, nents, GFP_KERNEL | __GFP_ZERO);
 	if (ret)
-		goto err_free_state;
+		goto err_free_iova;
 
 	sgl = dma->sgt.sgl;
 
@@ -156,7 +156,7 @@ struct sg_table *dma_buf_phys_vec_to_sgt(struct dma_buf_attachment *attach,
 						       phys_vec[i].paddr);
 		} else if (dma_use_iova(dma->state)) {
 			ret = dma_iova_link(attach->dev, dma->state,
-					    phys_vec[i].paddr, 0,
+					    phys_vec[i].paddr, mapped_len,
 					    phys_vec[i].len, dir,
 					    DMA_ATTR_MMIO);
 			if (ret)
@@ -202,18 +202,24 @@ struct sg_table *dma_buf_phys_vec_to_sgt(struct dma_buf_attachment *attach,
 	return &dma->sgt;
 
 err_unmap_dma:
-	if (!i || !dma->state) {
+	if (!dma->state) {
 		; /* Do nothing */
 	} else if (dma_use_iova(dma->state)) {
-		dma_iova_destroy(attach->dev, dma->state, mapped_len, dir,
-				 DMA_ATTR_MMIO);
+		if (mapped_len)
+			dma_iova_unlink(attach->dev, dma->state, 0, mapped_len,
+					dir, DMA_ATTR_MMIO);
 	} else {
-		for_each_sgtable_dma_sg(&dma->sgt, sgl, i)
+		for_each_sgtable_dma_sg(&dma->sgt, sgl, i) {
+			if (!sg_dma_len(sgl))
+				break;
 			dma_unmap_phys(attach->dev, sg_dma_address(sgl),
 				       sg_dma_len(sgl), dir, DMA_ATTR_MMIO);
+		}
 	}
 	sg_free_table(&dma->sgt);
-err_free_state:
+err_free_iova:
+	if (dma->state && dma_use_iova(dma->state))
+		dma_iova_free(attach->dev, dma->state);
 	kfree(dma->state);
 err_free_dma:
 	kfree(dma);
@@ -251,6 +257,7 @@ void dma_buf_free_sgt(struct dma_buf_attachment *attach, struct sg_table *sgt,
 				       sg_dma_len(sgl), dir, DMA_ATTR_MMIO);
 	}
 
+	sgt->orig_nents = sgt->nents;
 	sg_free_table(sgt);
 	kfree(dma->state);
 	kfree(dma);

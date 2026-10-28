@@ -1916,7 +1916,9 @@ static u64 pf_profile_fair_lmem(struct xe_gt *gt, unsigned int num_vfs)
 {
 	struct xe_tile *tile = gt_to_tile(gt);
 	bool admin_only_pf = xe_sriov_pf_admin_only(tile->xe);
-	u64 usable = xe_vram_region_usable_size(tile->mem.vram);
+	u64 usable = tile->mem.vram->p2p_carveout_size ?
+		     tile->mem.vram->p2p_carveout_start :
+		     xe_vram_region_usable_size(tile->mem.vram);
 	u64 spare = pf_get_min_spare_lmem(gt);
 	u64 available = usable > spare ? usable - spare : 0;
 	u64 shareable = ALIGN_DOWN(available, SZ_1G);

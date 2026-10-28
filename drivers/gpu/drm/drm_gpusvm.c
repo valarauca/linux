@@ -1483,6 +1483,8 @@ int drm_gpusvm_get_pages(struct drm_gpusvm *gpusvm,
 	int err = 0;
 	struct dev_pagemap *pagemap;
 	struct drm_pagemap *dpagemap;
+	bool p2pdma_mapped;
+	bool iova_tried;
 	struct drm_gpusvm_pages_flags flags;
 	enum dma_data_direction dma_dir = ctx->read_only ? DMA_TO_DEVICE :
 							   DMA_BIDIRECTIONAL;
@@ -1554,6 +1556,8 @@ map_pages:
 
 	zdd = NULL;
 	pagemap = NULL;
+	p2pdma_mapped = false;
+	iova_tried = false;
 	num_dma_mapped = 0;
 	for (i = 0, j = 0; i < npages; ++j) {
 		struct page *page = hmm_pfn_to_page(pfns[i]);
@@ -1563,6 +1567,11 @@ map_pages:
 		    is_device_coherent_page(page)) {
 			struct drm_pagemap_zdd *__zdd =
 				drm_pagemap_page_zone_device_data(page);
+
+			if (p2pdma_mapped) {
+				err = -EOPNOTSUPP;
+				goto err_unmap;
+			}
 
 			if (!ctx->allow_mixed &&
 			    zdd != __zdd && i > 0) {
@@ -1608,6 +1617,22 @@ map_pages:
 				err = -EFAULT;
 				goto err_unmap;
 			}
+		} else if (is_pci_p2pdma_page(page) && ctx->p2pdma_map) {
+			if (ctx->devmem_only) {
+				err = -EFAULT;
+				goto err_unmap;
+			}
+
+			if (pagemap) {
+				err = -EOPNOTSUPP;
+				goto err_unmap;
+			}
+
+			err = ctx->p2pdma_map(svm_pages->drm, page, order,
+					      dma_dir, &svm_pages->dma_addr[j]);
+			if (err)
+				goto err_unmap;
+			p2pdma_mapped = true;
 		} else {
 			dma_addr_t addr;
 
@@ -1622,9 +1647,11 @@ map_pages:
 				goto err_unmap;
 			}
 
-			if (!i)
+			if (!iova_tried) {
 				dma_iova_try_alloc(svm_pages->drm->dev, state,
 						   0, npages * PAGE_SIZE);
+				iova_tried = true;
+			}
 
 			if (dma_use_iova(state)) {
 				err = dma_iova_link(svm_pages->drm->dev, state,
